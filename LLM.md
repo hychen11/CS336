@@ -1,3 +1,5 @@
+https://chat.deepseek.com/a/chat/s/bcf96843-9e2a-46d6-b0bc-0b788ba4b89c
+
 https://qa9vavmvcb6.feishu.cn/docx/U48Odz8tEovBq0xlaOKck1KknBh
 
 # Tokenizer
@@ -567,6 +569,31 @@ mask = torch.triu(torch.ones(seq_len,seq_len),diagnal=1)
 
 <img src="/Users/chenhaoyang/Library/Application Support/typora-user-images/image-20251002174342628.png" alt="image-20251002174342628" style="zoom:50%;" />
 
+# Norm
+
+### Pre-LN vs Post-LN
+
+Transformer 原版 (Vaswani 2017) 用 **Post-LN**：
+
+```
+x → Attention → Add → LayerNorm
+x → FFN → Add → LayerNorm
+```
+
+- LayerNorm 在 **残差之后**
+- 会导致深层 Transformer 训练不稳定，需要调小学习率
+
+Pre-LN：
+
+```
+x → LayerNorm → Attention → Add
+x → LayerNorm → FFN → Add
+```
+
+- LayerNorm 在 **残差之前**
+- 可以稳定训练深层 Transformer
+- 也称为 **Pre-Norm Transformer**
+
 # Trival
 
 ## Torch
@@ -656,3 +683,16 @@ update = learning_rate * (动量估计 / sqrt(方差估计 + ε))
 <img src="/Users/chenhaoyang/Library/Application Support/typora-user-images/image-20251002175359591.png" alt="image-20251002175359591" style="zoom:50%;" />
 
 <img src="/Users/chenhaoyang/Library/Application Support/typora-user-images/image-20251002175545665.png" alt="image-20251002175545665" style="zoom:50%;" />
+
+# Normalization
+
+# Decoding
+
+### greedy search
+
+### beam search
+
+### top k
+
+### top p
+
