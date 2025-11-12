@@ -222,6 +222,10 @@ total_flops = 6*70e9*15e12
 
 1 次 **反向传播**（backward pass）大概 ≈ 4 × 参数数量
 
+这里4就是需要计算两次矩阵乘法
+
+一个计算梯度权重，一个计算梯度的输入
+
 ```python
 bytes_per_parameter = 4 + 4 + (4 + 4) # parameters, gradients, optimizer state
 ```
@@ -229,6 +233,10 @@ bytes_per_parameter = 4 + 4 + (4 + 4) # parameters, gradients, optimizer state
 use float32 for parameters and gradients, also use bf16 for parameters and gradients (2 + 2) and keep an extra float32 copy of the parameters (4). This doesn't save memory, but is faster.
 
 activations are not accounted for
+
+H100s support two variants of FP8: E4M3 (range [-448, 448]) and E5M2  ([-57344, 57344])
+
+## tensor
 
 ### `tensors_basics()`
 
@@ -242,7 +250,7 @@ x=torch.randn(4,8)
 
 x=torch.empty(4,8)
 #set the value later
-nn.init.trunc_normal_(x,mean=0,std=1,a=-2,b=2)
+nn.init.trunc_normal_(x,mean=0,std=1,a=-2,b=2) #截断正态分布初始化函数，a截断下界，b截断上界
 ```
 
 ### `tensors_memory()`
@@ -252,6 +260,8 @@ nn.init.trunc_normal_(x,mean=0,std=1,a=-2,b=2)
 1 sign + 8 exponent + 23 fractions
 
 **Float16** (2bytes)
+
+fp16 5exp
 
 1 sign + 5 exponent + 10 fractions
 
@@ -267,6 +277,8 @@ assert x == 0  # Underflow!
 1 sign + 8 exponent + 7 fractions
 
 没有underflow了
+
+bf16 8exp
 
 **Fp8**
 
@@ -290,6 +302,11 @@ y.device = torch.device("cuda",0)
 
 #### `tensor_storage()`
 
+```python
+x.stride(dim)
+# 在 PyTorch 中，x.stride(dim) 表示：在维度 dim 上移动一步（索引 +1）时，在底层内存中要跳过多少个元素。
+```
+
 #### `tensor_slicing()`
 
 Many operations simply provide a different view of the tensor.
@@ -312,8 +329,13 @@ assert torch.equal(y, torch.tensor([[1, 2], [3, 4], [5, 6]]))
 assert same_storage(x, y)
 
 y = x.transpose(1, 0) # @inspect y
+y.view(2,3)
 assert torch.equal(y, torch.tensor([[1, 4], [2, 5], [3, 6]]))
 assert same_storage(x, y)
+
+# One can enforce a tensor to be contiguous first
+y = x.transpose(1, 0).contiguous().view(2, 3) # @inspect y
+assert not same_storage(x, y)
 ```
 
 #### `tensor_elementwise()`
@@ -329,3 +351,86 @@ x = torch.ones(3, 3).triu()
 #### `tensor_einops()`
 
 Einops is a library for manipulating tensors
+
+```python
+z = einsum(x, y, "batch seq1 hidden, batch seq2 hidden -> batch seq1 seq2")
+# Or can use ... to represent broadcasting over any number of dimensions
+z = einsum(x, y, "... seq1 hidden, ... seq2 hidden -> ... seq1 seq2") 
+
+x: Float[torch.Tensor, "batch seq hidden"] = torch.ones(2, 3, 4)
+y = x.mean(dim=-1)
+y = reduce(x, "... hidden -> ...", "sum")
+
+# rearrange
+x: Float[torch.Tensor, "batch seq total_hidden"] = torch.ones(2, 3, 8)
+# ...where total_hidden is a flattened representation of heads * hidden1
+w: Float[torch.Tensor, "hidden1 hidden2"] = torch.ones(4, 4)
+# Break up total_hidden into two dimensions (heads and hidden1)
+x = rearrange(x, "... (heads hidden1) -> ... heads hidden1", heads=2) 
+# Perform the transformation by w:
+x = einsum(x, w, "... hidden1, hidden1 hidden2 -> ... hidden2") # @inspect x
+# Combine heads and hidden2 back together:
+x = rearrange(x, "... heads hidden2 -> ... (heads hidden2)") # @inspect x
+```
+
+**A100 has a peak performance of 312 teraFLOP/s**
+
+```
+assert a100_flop_per_sec == 312e12
+```
+
+**H100 has a peak performance of 1979 teraFLOP/s with sparsity, 50% without**
+
+```
+assert h100_flop_per_sec == 1979e12 / 2
+```
+
+### **Model FLOPs utilization (MFU)**
+
+Definition: (actual FLOP/s) / (promised FLOP/s) [ignore communication/overhead]
+
+mfu = actual_flop_per_sec / promised_flop_per_sec # @inspect mfu
+
+**Usually, MFU of >= 0.5 is quite good (and will be higher if matmuls dominate)**
+
+**comparing bfloat16 to float32, the actual FLOP/s is higher**
+
+Putting it togther:
+
+Forward pass: 2 (# data points) (# parameters) FLOPs
+
+Backward pass: 4 (# data points) (# parameters) FLOPs
+
+Total: 6 (# data points) (# parameters) FLOPs
+
+### data_loading
+
+`orig_data.tofile("data.npy")`
+
+Use memmap to lazily load only the accessed parts into memory.
+
+`data = np.memmap("data.npy", dtype=np.int32)`
+
+By default, CPU tensors are in paged memory. We can explicitly pin
+
+x = x.pin_memory()
+
+**This allows us to copy** x **from CPU into GPU asynchronously.**
+
+`x = x.to(device, non_blocking=True)`
+
+This allows us to do two things in parallel (not done here):
+
+Fetch the next batch of data into CPU
+
+Process x on the GPU.
+
+**Let's define the AdaGrad optimizer**
+
+* momentum = SGD + exponential averaging of grad
+
+* AdaGrad = SGD + averaging by grad^2
+
+* RMSProp = AdaGrad + exponentially averaging of grad^2
+
+* Adam = RMSProp + momentum
