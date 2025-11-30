@@ -434,3 +434,281 @@ Process x on the GPU.
 * RMSProp = AdaGrad + exponentially averaging of grad^2
 
 * Adam = RMSProp + momentum
+
+# Lec 3
+
+### Pre-vs-post norm
+
+just use Pre norm!!!
+
+post norm will be unstable and have to do some careful lr warm-up style things
+
+Grok and gamma 2 add layer norm after FFN
+
+![](./assets/L3_1.png)
+
+> why layer norm in the residual path bad?
+>
+> the residual gives you the identity connection from top to bottom, this makes gradient propagation very easy. Put layer in the residual might mess that kind of gradient behavior
+
+### LayerNorm vs RMSNorm
+
+nearly all the model use RMSNorm
+
+Modern explanation – it’s faster (and just as good).
+
+• Fewer operations (no mean calculation)
+
+• Fewer parameters (no bias term to store)
+
+![](./assets/L3_2.png)
+
+important to think about the memory, not just about FLOPS
+
+![](./assets/L3_3.png)
+
+### dropping bias terms
+
+Most modern transformers don’t have bias terms.
+
+$FFN(x)=\sigma(xW_1)W_2$
+
+Reasons: memory (similar to RMSnorm) and optimization stability
+
+### recap
+
+Basically everyone does pre-norm.
+
+* Intuition – keep the good parts of residual connections
+
+* Observations – nicer gradient propagation, fewer spike
+
+* Some people add a second norm outside the residual stream (NOT post-norm)
+
+Most people do RMSnorm
+
+* In practice, works as well as LayerNorm
+
+* But, has fewer parameters to move around, which saves on wallclock time
+
+* People more generally drop bias terms since the compute/param tradeoffs are not great.
+
+### Activations
+
+Llama, PaLM,T5 v1.1, most models post 2023 use SwiGLU/GeGLU
+
+SwiGLU (swish is 𝑥 ∗ sigmoid(𝑥))
+
+> Note: Gated models use smaller dimensions for the 𝑑𝑓𝑓 by 2/3???
+
+可以把 **gating activation（门控制激活）** 理解成：
+
+> **网络在每个位置用一个门（gate）来决定：信息要放大、通过、还是被压下去。**
+
+它不是只做“激活”，而是在激活 *前后* 加上一个可学习的“门”，让模型动态控制流经的信号量。
+
+下面用你能最快抓住直觉的方式解释。
+
+y = gate(x) ⊙ activation(x)
+
+门（gate）一般是：
+
+- sigmoid
+- swish
+- GLU gate: linear(x1) + sigmoid(x2)
+- 或者更复杂如 SwiGLU, GeGLU, ReGLU  
+
+### consensus hyperparameter 1
+
+There are two dimensions that are relevant – the feedforward dim (𝑑𝑓𝑓) and model dim (𝑑𝑚𝑜𝑑𝑒𝑙 ). What should their relationship be?
+
+$d_{ff} = 4d_{model}$
+
+This is almost always true. There’s just a few exceptions.
+
+Remember that GLU variants scale down by 2/3rd. This means most GLU variants have 𝑑𝑓𝑓 =8/3𝑑𝑚𝑜𝑑𝑒𝑙 .
+
+The ‘default’ choices of 𝑑𝑓𝑓 = 4𝑑𝑚𝑜𝑑𝑒𝑙 and GeLU 𝑑𝑓𝑓 = 2.66𝑑𝑚𝑜𝑑𝑒𝑙 have worked well for nearly all modern LLMs.
+
+### Aspect ratios
+
+𝒅𝒎𝒐𝒅𝒆𝒍/𝒏𝒍𝒂𝒚𝒆𝒓
+
+Extremely deep models are harder to parallelize and have higher latency
+
+### vocabulary sizes
+
+Monolingual models – 30-50k vocab
+
+Multilingual / production systems 100-250k
+
+### Dropout and other regularization
+
+pretraining dont need regularization?
+
+pretraining usually need one epoch
+
+There is a lot of data (trillions of tokens), more than parameters., SGD only does a single pass on a corpus (hard to memorize)
+
+drop out 用的少了，一般用weight decay? Intuition violation!
+
+> #### weight decay
+>
+> 传统梯度下降更新是：
+> $$
+> w \leftarrow w - \eta \cdot \nabla L(w)
+> $$
+> 加入 weight decay（L2 正则）后：
+> $$
+> w \leftarrow w - \eta \cdot (\nabla L(w) + \lambda w)
+> $$
+> 也就是多加了一个项：
+> $$
+> \lambda w
+> $$
+> 这就等价于每次都把权重往 0 拉一点。
+>
+> 因为“大的参数”容易导致模型更复杂、更加拟合训练数据。 Weight Decay 让模型更平滑、更简单，从而提高泛化能力。可以防止过拟合
+
+Many older models used dropout during pretraining
+
+Newer models (except Qwen) rely only on weight decay
+
+#### Why weight decay LLMs
+
+优化损失函数提升性能
+
+It’s not to control overfitting
+
+为什么不用drop out了呢？是因为单epoch情况下没有必要
+
+### Stability tricks
+
+Softmaxes – can be ill-behaved due to exponentials / divison by zero
+
+原本的softmax 就是Z(x) = $\Sigma e^{x_i}$
+
+然后z loss 就是在loss function上
+
+它是一个额外加到 loss 上的小项，形式如下：减去
+$$
+L_{z} = \alpha \cdot \left( \sum_i z_i^2 \right)
+$$
+
+#### Softmax
+
+假设模型输出 logits $\mathbf{z} = [z_1, z_2, \dots, z_V]$（Vocab size 为 $V$）：
+$$
+\text{softmax}(z_i) = \frac{e^{z_i}}{\sum_{j=1}^V e^{z_j}}
+$$
+通常训练的目标是 **交叉熵 loss**：
+$$
+L_{\text{CE}} = - \log \frac{e^{z_{y}}}{\sum_j e^{z_j}} = -z_y + \log \sum_j e^{z_j}
+$$
+
+#### z loss
+
+$$
+L_z = \alpha \, s^2 = \alpha \, (\log \sum_i e^{z_i})^2
+$$
+
+训练总 loss：
+$$
+L = L_{\text{CE}} + L_z = -z_y + \log \sum_j e^{z_j} + \alpha (\log \sum_j e^{z_j})^2
+$$
+优化成功的话，logZ(x)恒等于0
+
+### QK norm
+
+The query and keys are Layer (RMS) normed before going into the softmax operation.
+
+![](./assets/L3_4.png)
+
+inference 也会保留
+
+### Attention heads
+
+GQA / MQA : Saving inference costs by reducing the number of heads
+
+#### Multi-Query Attention (MQA) 
+
+have multiple queries, but just one dimension for keys and values
+
+#### Does MQA hurt? 
+
+Small PPL hit w/ MQA [Shazeer 2019] 
+
+#### GQA
+
+Don’t go all the way to one dimension of KV – have fewer dims
+
+Simple knob to control expressiveness (key-query ratio) and inference efficiency
+
+![](./assets/L3_5.png)
+
+### Sparse window attention
+
+Attending to the entire context can be expensive (quadratic).
+
+Build sparse / structured attention that trades off expressiveness vs runtime (GPT3)
+
+### sliding window attention
+
+Just use the main part of the strided pattern – let depth extend effective context (Mistral)
+
+简单说sparse更灵活
+
+**局部 + 全局**（Longformer/BigBird）
+
+- 局部是固定窗口
+- 全局 token 可以 attend 所有位置
+
+**随机稀疏**（Reformer、一些 block-sparse Transformer）
+
+- 每个 token 的注意力位置部分随机选取
+- 用于长序列时降低复杂度
+
+### Current standard trick – interleave ‘full’ and ‘LR’ attention
+
+From Cohere Command A – Every 4th layer is a full attention
+
+- 大部分层（3/4）使用 **滑动窗口注意力**（高效，计算量小）
+- 每隔 3 层，第 4 层使用 **全注意力**（捕捉全局信息）
+
+Long-range info via NoPE, short-range info via RoPE + SWA.
+
+# LMs
+
+![](./assets/TS1.png)
+
+FF layers use SwiGLU, not ReLU
+
+## Pre-vs-post norm
+
+![](./assets/TS2.png)
+
+If putting LayerNorms in residual streams is bad.. Why not post-norm outside the stream?
+
+## LayerNorm vs RMSNorm
+
+![](./assets/TS3.png)
+
+## Perplexity
+
+“困惑率”（**Perplexity, PPL**）是衡量语言模型预测能力的一个经典指标，尤其在 **概率语言模型和 LLM** 中用得非常广泛
+
+假设模型给定一个序列 $x_1, x_2, \dots, x_N$，语言模型会计算条件概率：
+$$
+P(x_1, x_2, \dots, x_N) = \prod_{t=1}^{N} P(x_t \mid x_1, \dots, x_{t-1})
+$$
+**困惑率**定义为：
+$$
+\text{PPL} = \exp \left( - \frac{1}{N} \sum_{t=1}^{N} \log P(x_t \mid x_1, \dots, x_{t-1}) \right)
+$$
+或者等价地：
+$$
+\text{PPL} = 2^{H}, \quad H = \text{交叉熵}
+$$
+PPL 越小 → 模型越“自信” → 预测越准确
+
+PPL 越大 → 模型越“困惑” → 预测不确定性高
