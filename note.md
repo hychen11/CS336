@@ -677,6 +677,141 @@ From Cohere Command A – Every 4th layer is a full attention
 
 Long-range info via NoPE, short-range info via RoPE + SWA.
 
+# Lec 4
+
+### Routing function
+
+![](./assets/L4_1.png)
+
+Token chooses experts 相当于就是一个word vector，乘一个W matrix，然后Sigmoid可以得到score了，这一一般K=2，
+
+![](./assets/L4_2.png)
+
+![](./assets/L4_3.png)
+
+#### Shared Experts DeepSeekMOE
+
+![](./assets/L4_4.png)
+
+分成粒度更小的Experts，还有shared Experts
+
+### Expert sizes
+
+Fine-grained ratio 就是和正常size对比的比例，比如 1/14，routed 就是总共的experts的个数，activate就是真正使用的个数，shared就是都使用，不参与路由的个数
+
+### How do we train MoEs
+
+Major challenge: we need sparsity for training-time efficiency…
+
+But sparse gating decisions are not differentiable!
+
+简单说就是希望高效训练只激活部分experts，但是有效学习需要所有参数都能得到梯度更新
+
+```
+# 理想中的稀疏路由（不可微分）
+expert_weights = router(input_tensor)  # 例如：[0.1, 0.8, 0.05, 0.05]
+selected_expert = argmax(expert_weights)  # 选择 index=1
+output = experts[selected_expert](input_tensor)  # 只使用专家1
+```
+
+这里的 `argmax()` 或 `top-k` 操作是**不可微分**的！
+
+不可微分是因为router是discrete的
+
+#### Solutions?
+
+1. Reinforcment learning to optimize gating policies
+2. Stochastic perturbations
+3. Heuristic ‘balancing’ losses. **DeepSeek**
+
+这里RL就是
+
+- 将路由选择视为**决策问题**
+- 使用策略梯度方法优化路由决策
+- RL is the ‘right solution’ but gradient variances and complexity means it’s not widely used
+
+Stochastic 通过注入可微分的噪声，使离散选择近似可微
+
+Heruistic添加额外的损失函数来间接引导路由决策，负载均衡损失（Load Balancing Loss）
+
+systems efficiency requires that we use experts evenly
+
+如果忽略别的constrains，存在一个问题是tokens router to one experts and end up in local minimum，也就是一个experts很好，别的experts啥都不会
+
+所以loss balancing可以避免这种local minimum
+
+![](./assets/L4_5.png)
+
+这里loss就是遍历整个experts，fi就是每个token分配到expert i的概率，是一个probability vector
+
+Pi是路由到expert i 的概率，Pi路由，fi就是Top-K做出的实际路由
+
+也就是获得越多的token，gradient下推的越厉害
+
+
+
+不仅对于expert还有不同的device进行shard
+
+#### DeepSeek v3 variation – per-expert biases
+
+![](./assets/L4_6.png)
+
+这里si,t是softmax的输出，bi就是一个fudge factor score for each expert
+
+如果获取tokens不够多，就是增加bi来获得更多token
+
+训练学习bi，如果太少tokens就bi加上gamma，太多就减去gamma，experts变得不attractive
+
+### upcycling
+
+把dense MLP当成MOE
+
+DeepSeek MoE v2 vs v1
+
+New things: Top-M device routing
+
+V1 每个token → Router → 选择top-k个专家 → 激活这些专家
+
+- 专家可能分布在不同的设备（GPU）上
+- **跨设备通信**：token需要在设备间传输，产生昂贵的通信开销
+
+**V2的核心创新**：**先在设备级别做路由，再在设备内部做专家路由**
+
+```
+传统MoE V1：
+token → Router → 选择专家(可能跨设备) → 跨设备通信 → 计算
+
+MoE V2 Top-M Device Routing：
+token → Device Router → 选择top-M个设备 → 
+    └→ 在每个选中设备内：Expert Router → 选择专家 → 计算
+```
+
+V3：**Sigmoid+Softmax topK + topM**
+
+softmax强制所有专家的概率和为1，这假设每个token**必须**使用专家，但有些token可能不需要任何专家！
+
+1. **稀疏性控制更灵活**：sigmoid允许某些专家得分为0
+2. **两阶段筛选**：先宽选(top-M)，再精选(top-K)，减少错误选择
+3. **自适应专家数量**：可以根据token复杂度动态选择专家数量
+
+### MLA
+
+Basic idea: express the Q, K, V as functions of a lower-dim, ‘latent’ activation
+
+Benefits: when KV-caching, we only need to store 𝑐𝑡
+
+𝐾𝑉, which can be much smaller.
+
+𝑊𝑈𝐾 can be merged into the Q projection
+
+(they also compress queries, for memory savings during training)
+
+Complexity: rope conflicts with MLA-style caching
+
+### MTP
+
+Have small, lightweight models that predict multiple steps ahead
+
 # LMs
 
 ![](./assets/TS1.png)
