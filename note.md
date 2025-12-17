@@ -812,6 +812,128 @@ Complexity: rope conflicts with MLA-style caching
 
 Have small, lightweight models that predict multiple steps ahead
 
+# Lec 5
+
+![](./assets/L5_1.png)
+
+Part 1: GPUs in depth – how they work and important parts
+
+Part 2: Understanding GPU performance
+
+Part 3: Putting it together – unpacking FlashAttention
+
+### scale law
+
+Parallel scale
+
+CPU large control branch prediction, GPU have little control logic orchestrating
+
+CPUs optimize for latency (each thread finishes quickly)
+
+GPUs optimize for throughput (total processed data)
+
+GPUs have many SM (streaming multiprocessors) that independently execute ‘blocks’ (jobs).
+
+Each SM further contains many SPs (streaming processor) that can execute ‘threads’ in parallel
+
+L1 and shared memory inside of SM, so it's quite fast
+
+### Side thread TPU
+
+TPU是Tensor Processing Unit，是专门加速机器学习的，有专门的MXU(matrix multiplication), VPU(data load in MXU, activation), 
+
+### roofline model
+
+### make GPUs go fast
+
+1. Control divergence (not a memory bottleneck..)
+
+2. Low precision computation
+
+3. Operator fusion
+
+4. Recomputation
+
+   也就是一个读中间计算值，一个就从头重新计算，通过cpu compute换memory bound，trade off
+
+   ![](./assets/L5_2.png)
+
+5. Coalescing memory
+
+6. Tiling
+
+   tile size T, each input is read N/T times from global memory, factor of T reduction in global memory access.
+
+### Complexities with tiling
+
+Tile sizes may not divide the matrix size and lead to low utilization
+
+like 256*256, tile 128 has 4 tiles, then 257\*256 tile 128 has 6 tiles
+
+### Complexities with tiling 2 – memory alignment
+
+![](./assets/L5_3.png)
+
+如果多了一个就double load了，可以padding
+
+### tiling
+
+Tiling has a major impact through alignment.
+
+### wave quantization
+
+periodic behavior 1792 to 1793
+
+Using a tile size of 256 × 128, there are 1792/256=7, 1792/128=14, 128= 7 × 14 = 98 tiles
+
+1793, 1793/256=8, 1793/128=15, 8*15=120 tiles
+
+An A100 has 108 SMs, so it cannot execute all 120
+
+so it will execute 108 sms first then rest of then 
+
+### making ML workloads go fast
+
+Reduce memory accesses
+
+* Coalescing
+* Fusion
+
+Move memory to shared memory
+
+* Tiling
+
+Trade memory for compute/accuracy
+
+* Quantization
+
+* Recomputation
+
+### Flash Attention
+
+> **FlashAttention = IO-aware tiled attention + fused kernel + online (incremental) softmax**
+
+它解决的不是算力问题，而是 **HBM 带宽瓶颈**。
+
+![](./assets/L5_5.png)
+
+```text
+HBM (global memory)   ← 慢 / 大
+L2 cache
+Shared memory (SRAM) ← 快 / 小
+Registers             ← 更快
+```
+
+HBM 每个tile从HBM读一次，QKV最初存放位置，SRAM tile里的QKV，tile里的partial softmax state，tile里output accumulation
+
+fusion是不把中间结果（QK、softmax score）写回 HBM，所有中间步骤都在一个 kernel 里，在 SRAM / registers 完成
+
+Kernel Fusion+tiling(tiling for KQV matrix multiply, incremental softmax)
+
+![](./assets/L5_4.png)
+
+
+
 # LMs
 
 ![](./assets/TS1.png)
