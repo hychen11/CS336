@@ -932,7 +932,466 @@ Kernel Fusion+tiling(tiling for KQV matrix multiply, incremental softmax)
 
 ![](./assets/L5_4.png)
 
+# Lec 6
 
+A100 108 SMs
+
+* DRAM [A100: 80GB] - big, slow
+
+* L2 cache [A100: 40MB]
+
+* L1 cache [A100: 192KB per SM] - small, fast
+
+Thread, Thread block, Grid
+
+> Why thread blocks? Shared memory.
+>
+> Intuition: group f(i)'s that read similar data together
+>
+> Threads within a thread block have shared memory (as fast as L1 cache) [A100: 164KB]
+>
+> Can synchronize threads (for reading/writing) within a block (but not across blocks)
+
+32 Threads into one wave, and the problem: last wave has fewer thread blocks, leaving some SMs idle (low occupancy).
+
+Wave quantization: make number of thread blocks divide # SMs.
+
+Rule of thumb: number of thread blocks should be >= 4x # SMs 经验法则，线程总数应该大于等于 4倍SMs
+
+### **Arithmetic intensity: # FLOPs / # bytes**
+
+* If high, operation is compute-bound (good)
+
+* If low, operation is memory-bound (bad)
+
+General rule: matrix multiplication is compute-bound, everything else is memory-bound
+
+计算性能拓展速度远大于内存性能扩展速度 scaling
+
+most of the cases, the computations are going to end up being memory bound. 也就受限于内存限制
+
+因为Matrix multiply是compute bound的，如果经过优化转为memory bound因此目标减少memory bound或者它的影响
+
+### IMPORTANT: benchmark/profile your code!
+
+#### benchmark()
+
+```python
+def benchmark(
+    description: str,
+    run: Callable,
+    num_warmups: int = 1,
+    num_trials: int = 3,
+):
+    """
+    Benchmark `run` by executing it multiple times and returning the mean latency (ms).
+    """
+
+    # Warm-up: first runs might be slower due to compilation, cache cold start, etc.
+    # We care about steady-state performance.
+    for _ in range(num_warmups):
+        run()
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    # Time it for real now
+    times: list[float] = []
+
+    for _ in range(num_trials):  # Run multiple times to capture variance
+        start_time = time.time()
+
+        run()  # Actually perform computation
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()  # Important: wait for CUDA kernels to finish
+
+        end_time = time.time()
+        times.append((end_time - start_time) * 1000)  # ms
+
+    mean_time = mean(times)
+    return mean_time
+```
+
+两个需要关注的点
+
+* 这里warm up的作用就是第一次是JIT即时编译，没有cache，所以第一次是startup speed，这个作用 avoid measuring startup speed, instead, measure steady state speed
+* CPU and GPU need synchronized by `torch.cuda.synchronize()`
+
+####   
+
+![](./assets/L6_1.png)
+
+这里kernel里写了tile size和nums，此外这里有kernel launch和synchronization of CUDA devices 
+
+kernel launch: CPU take the command and send it over to the GPU
+
+cudaDeviceSynchronize waiting for GPU finish and send things back to CPU
+
+Ms Millisecond, us MicroSecond, ns NanoSecond
+
+#### aten 是PyTorch的C语言接口
+
+ATen 是 PyTorch 的 **底层张量（Tensor）库**，它提供了张量操作的核心实现，比如加法、乘法、卷积等。
+
+是 PyTorch C++ 核心的一部分，很多 Python 层面的 torch.add 或 + 操作，最终都会调用 ATen 实现。
+
+### matmul
+
+cuda spend more time
+
+if large dimension, execute cutlass::Kernel
+
+if small dimension, execute xmma
+
+different dimension and hardware will dispatch to different matrix multiply primitives under the hood
+
+so it has different performance characteristics
+
+### cutlass
+
+在 GPU 上高效实现矩阵乘法（GEMM）、卷积等线性代数运算，同时自动利用 **Tensor Core**
+
+是 **模板库**，所以几乎所有参数（数据类型、tile 大小、线程分配策略、tensor core 硬件启用）都在编译期确定
+
+不只是一个单纯的“GEMM kernel”，而是一套 **可组合的层次化 GPU kernel 构建框架**
+
+#### 为什么高性能
+
+* 层次化 tiling / memory hierarchy 优化
+
+  GPU 的性能瓶颈通常是 **内存访问**，特别是 global memory。CUTLASS 对 GEMM 做了多层 tiling
+
+  | **层级**                 | **作用**                                                     |
+  | ------------------------ | ------------------------------------------------------------ |
+  | Thread-level tile        | 每个线程计算小块结果，利用 register                          |
+  | Warp-level tile          | 由 warp 内线程共享 load / store 数据，使用 warp shuffle      |
+  | Block-level tile         | Block 内共享 memory (shared memory) 存放 tile，提高 global memory reuse |
+  | Grid-level decomposition | 多 block 分配全矩阵任务，实现并行                            |
+
+  > 普通 tiling GEMM 可能只考虑 **block-level tile** 或线程级 tile，没有精细设计多层 tile 和 warp shuffle
+
+* Tensor Core / SIMT 优化
+
+  CUTLASS 可以生成 **Tensor Core GEMM kernel**（使用 FP16/TF32/INT8），而不是普通的 CUDA core GEMM。
+
+   它的 **warp-level tile + MMA (Matrix Multiply-Accumulate) instructions** 可以充分利用 Tensor Core 的矩阵乘法硬件，速度比普通 FP32 GEMM 高很多。
+
+* Memory movement 和 overlap
+
+  CUTLASS 使用 **double buffering**（寄存器和 shared memory 之间）
+
+  - 一边计算当前 tile；
+  - 一边 preload 下一个 tile 数据到 shared memory
+
+  这样计算和内存访问可以 **完全重叠**，减少 idle
+
+* 模板生成 / 编译期优化
+
+  所有 tile 大小、loop unrolling、vectorization、memory alignment 都在 **编译期确定**，减少 runtime 分支和索引计算开销。
+
+  CUDA kernel 里很少用 if/else，几乎都是 straight-line code → better ILP
+
+### Observations
+
+You can see what CUDA kernels are actually being called.
+
+Different CUDA kernels are invoked depending on the tensor dimensions.
+
+Name of CUDA kernel tells us something about the implementation.
+
+Example: **cutlass_80_simt_sgemm_256x128_8x4_nn_align1**
+
+cutlass: NVIDIA's CUDA library for linear algebra
+
+256x128: **tile size**
+
+### cdist
+
+vector a and vector b, cdist is their Euclidean distance
+
+```
+aten::cdist
+aten::_euclidean_dist
+Torch command map in C interface to sort of lower level C disk
+then we have bunch of primitive: aten::matmul, aten::mm 78%, aten::cat 6.7%, aten::pow 5.0%
+matrix multiplies, concatenation拼接, taking the powers 取幂
+```
+
+可以优化matrix multiply
+
+### gelu
+
+gelu就是`x 被保留下来的概率 × x 本身`
+
+$\text{GELU}(x) = x \cdot \Phi(x)$
+
+linear structure plus non-linear structure in MLP
+
+```
+gelu_function = lambda a, b: torch.nn.functional.gelu(a + b)
+gelu_profile = profile("gelu", run_operation2(dim=2048, operation=gelu_function))
+```
+
+### softmax
+
+### mlp
+
+profile it like using torch profiler, but not a good way!
+
+### Nsight System
+
+In cuda part, like CUDA HW, there is what GPU is doing
+
+In Threads part, there is what CPU is doing
+
+#### **NVTX（NVIDIA Tools Extension）** 
+
+> **给 GPU / CPU 程序“打时间轴标签”的工具，用来让 profiler 看懂你的代码在干什么**
+
+```python
+# mark all the above range of code belong to defind_model part
+with nvtx.range("defind_model"):
+  mdoel = MLP(dim,num_layers).to(get_device())
+	# will record step, add annotation before calling profiler
+  nvtx.range_push(f"step_{step}")
+  nvtx.range_pop()
+```
+
+first time call a piece of code in PyTorch, it doesn't directly execute, it will actually do things like on the fly compile things
+
+like runtime trigger and module loading initialize the layer and the computation and move code into GPU
+
+CPU 说正在doing layer 1时，实际上它queuing commands into the GPU，处理速度大于GPU，所以GPU开始处理layer1的时候，CPU已经处理到layer9
+
+然后CPU会维持一个队列，一旦超前达到队列上限，就会暂停这种超前运行
+
+还有一个注意点就是 print statement，比如`print(f"loss:{y.item():.6f")`，这个在CPU上执行，需要获取GPU计算出的那个值，所以几乎变成Synchronized了！
+
+CPU不会成为bottleneck！
+
+### CUDA
+
+Grid: collection of thread blocks: numBlocks = (2, 4), blockDim = (1, 8)
+
+Thread block: collection of threads: blockIdx = (0, 1)
+
+Thread: single unit of operation: threadIdx = (0, 3).
+
+write code for a thread, using 3 parameters: (blockIdx, blockDim, threadIdx) 
+
+Set CUDA_LAUNCH_BLOCKING so that if there are errors, CUDA will tell you what went wrong.
+
+```c
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+```
+
+比如Gelu，最开始就是kernel，会被发送到GPU，GPU执行后返回内容，后面是wrapper
+
+```c
+__global__ void gelu_kernel(float* in, float *out){
+  // Get the index into the tensor
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < num_elements) { // To handle the case when n < numBlocks * blockDim
+  	// Do the actual computation
+  	out[i] = 0.5 * in[i] * (1.0 + tanh(0.79788456 * (in[i] + 0.044715 * in[i] * in[i] * in[i])));
+  }
+}
+inline unsigned int cdiv(unsigned int a, unsigned int b) {
+  // Compute ceil(a / b)
+  return (a + b - 1) / b;
+}
+
+torch::Tensor gelu(torch::Tensor x) {
+TORCH_CHECK(x.device().is_cuda());
+TORCH_CHECK(x.is_contiguous());
+// Allocate empty tensor
+torch::Tensor y = torch::empty_like(x);
+// Determine grid (elements divided into blocks)
+int num_elements = x.numel();
+int block_size = 1024; // Number of threads
+int num_blocks = cdiv(num_elements, block_size);
+// Launch the kernel
+gelu_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), num_elements);
+C10_CUDA_KERNEL_LAUNCH_CHECK(); // Catch errors immediately
+return y;
+}
+```
+
+在wrapper函数里，首先检查X是不是在GPU上，其次是不是continuous连续的
+
+```c
+TORCH_CHECK(x.device().is_cuda());
+TORCH_CHECK(x.is_contiguous());
+```
+
+> **If not continuous?**
+>
+> assert will report error,
+>
+> there is almost no reason for memory to be fragmented, cause it will allocate continously 
+>
+> Transpose or views shuffling will cause this problem, since the access to data is uncontinously, but wrapper can handle it??
+>
+> **Why manual slow**
+>
+> DRAM to SM communication cost 这个占主要 
+
+然后创造empty tensor，计算总数，计算block_size，最后cdiv 计算block数量，ceil上取整，这个是bookkeeping预处理 
+
+## Triton
+
+will manage coalescing of memory, like in DRAM get 4 adjacent values at a time (burst mode)
+
+* Memory coalescing (transfer from DRAM) 
+* Shared memory management
+* Scheduling within SMs
+* Scheduling across SMs
+
+```python
+def triton_gelu(x: torch.Tensor):
+    assert x.is_cuda
+    assert x.is_contiguous()
+
+    # Allocate output tensor
+    y = torch.empty_like(x)
+
+    # Determine grid (elements divided into blocks)
+    num_elements = x.numel()
+    block_size = 1024  # Number of threads
+    num_blocks = triton.cdiv(num_elements, block_size)
+
+    triton_gelu_kernel[(num_blocks,)](
+        x, y, num_elements, BLOCK_SIZE=block_size
+    )
+    return y
+
+
+@triton.jit
+def triton_gelu_kernel(x_ptr, y_ptr, num_elements, BLOCK_SIZE: tl.constexpr):
+    # Input is at `x_ptr` and output is at `y_ptr`
+    # | Block 0 | Block 1 | ... |
+    # BLOCK_SIZE num_elements
+
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+
+    # Indices where this program instance should operate
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    # Handle boundary
+    mask = offsets < num_elements
+
+    # Read
+    x = tl.load(x_ptr + offsets, mask=mask)
+
+    # Approx GELU:
+    # 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    # tanh(a) = (exp(2a) - 1) / (exp(2a) + 1)
+    a = 0.79788456 * (x + 0.044715 * x * x * x)
+    exp = tl.exp(2 * a)
+    tanh = (exp - 1) / (exp + 1)
+    y = 0.5 * x * (1 + tanh)
+
+    # Store
+    tl.store(y_ptr + offsets, y, mask=mask)
+```
+
+Load 4 values at a time
+
+`@%p1 ld.global.v4.b32 { %r2, %r3, %r4, %r5 }, [ %rd1 + 0 ];`
+
+Triton在py文件里，但是由于下面的
+
+-  `@triton.jit`
+- 用 `tl.load / tl.store / tl.arange`
+- 像 NumPy / PyTorch 一样写
+
+```
+@triton.jit
+def kernel(x_ptr, y_ptr, ...):
+    x = tl.load(...)
+```
+
+这段代码：
+
+- **不会由 Python 解释器逐行执行**
+- 而是被 **Triton 编译器分析 AST**
+- 然后 **JIT 编译成 GPU kernel**
+
+
+
+### torch.compile
+
+```python
+compiled_gelu = torch.compile(manual_gelu)
+```
+
+It will automatic optimization, like kernel fusion
+
+so model jit is pretty great, can do optimization
+
+```python
+def triton_softmax(x: torch.Tensor):
+    # Allocate output tensor
+    y = torch.empty_like(x)
+
+    # Determine grid
+    M, N = x.shape
+    block_size = triton.next_power_of_2(N) # Each block contains all the columns
+    num_blocks = M  # One block per row
+
+    # Launch kernel
+    triton_softmax_kernel[(M,)](
+        x_ptr=x,
+        y_ptr=y,
+        x_row_stride=x.stride(0),
+        y_row_stride=y.stride(0),
+        num_cols=N,
+        BLOCK_SIZE=block_size,
+    )
+
+    return y
+
+
+@triton.jit
+def triton_softmax_kernel(
+    x_ptr,
+    y_ptr,
+    x_row_stride,
+    y_row_stride,
+    num_cols,
+    BLOCK_SIZE: tl.constexpr,
+):
+    assert num_cols <= BLOCK_SIZE
+
+    # Process each row independently
+    row_idx = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+
+    # Read from global memory
+    x_start_ptr = x_ptr + row_idx * x_row_stride
+    x_ptrs = x_start_ptr + col_offsets
+    x_row = tl.load(
+        x_ptrs,
+        mask=col_offsets < num_cols,
+        other=float("-inf"),
+    )
+
+    # Compute softmax
+    x_row = x_row - tl.max(x_row, axis=0)
+    numerator = tl.exp(x_row)
+    denominator = tl.sum(numerator, axis=0)
+    y_row = numerator / denominator
+
+    # Write back to global memory
+    y_start_ptr = y_ptr + row_idx * y_row_stride
+    y_ptrs = y_start_ptr + col_offsets
+    tl.store(y_ptrs, y_row, mask=col_offsets < num_cols)
+
+```
+
+triton is much like python code, it needs more load, store and some trace part.
 
 # LMs
 
