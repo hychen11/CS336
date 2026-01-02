@@ -1393,7 +1393,236 @@ def triton_softmax_kernel(
 
 triton is much like python code, it needs more load, store and some trace part.
 
+# Lec 7
+
+## Basics of networking for LLMs
+
+#### Intra-node
+
+```python
+# 单机8卡服务器
+import torch
+import torch.distributed as dist
+
+# 初始化进程组
+dist.init_process_group(
+    backend='nccl',  # NVIDIA Collective Communications Library
+    init_method='tcp://localhost:23456',  # 本地通信
+    world_size=8,     # 8个GPU都在同一节点
+    rank=0           # 当前GPU的rank
+)
+
+# 节点内通信非常快，因为：
+# 1. 通过PCIe或NVLink直接连接
+# 2. 共享系统内存
+# 3. 延迟极低
+
+# 1. NVLink（最快）
+# NVIDIA专用，GPU到GPU直连
+# 带宽：900GB/s（NVLink 4.0）
+# 延迟：~100纳秒
+
+# 2. PCIe 5.0
+# 通用标准
+# 带宽：128GB/s（双向）
+# 延迟：~500纳秒
+
+# 3. 共享内存
+# GPU间可以直接访问对方内存
+# 零拷贝，最快的数据共享
+```
+
+#### Inter-node
+
+```python
+# 多机集群（比如4台服务器，每台8卡）
+# 总共32个GPU
+
+# 节点0上的代码
+dist.init_process_group(
+    backend='nccl',
+    init_method='tcp://10.0.0.1:23456',  # 跨节点通信
+    world_size=32,    # 32个GPU分布在4个节点
+    rank=0           # 全局rank
+)
+
+# 节点间通信需要考虑：
+# 1. 网络带宽限制
+# 2. 网络延迟
+# 3. 网络稳定性
+
+# 1. InfiniBand（高性能计算）
+# 带宽：400Gbps（HDR）
+# 延迟：<1微秒
+# RDMA支持：远程直接内存访问
+
+# 2. 以太网（通用）
+# 带宽：100Gbps
+# 延迟：10-100微秒
+# 成本低，部署简单
+
+# 3. RoCE（RDMA over Converged Ethernet）
+# 在以太网上实现RDMA
+# 性价比高
+```
+
+由NCCL 英伟达集合通信库提供底层支持，下面例子都是假设有4个rank
+
+![](./assets/L7_1.png)
+
+**通信数据量（Communication Volume）** 和 **算法步数（Latency Steps）**衡量集合通信的开销
+
+#### All reduce
+
+e.g. have 4 ranks, each have its own data, need to perform reduction operation, and copy the output to every single machine 
+
+**All-Reduce = Reduce Scatter + All Gather**
+
+先每个GPU拿自己的一部分，然后再Gather贡献拼出完整数据
+
+#### Broadcast
+
+Communication Volume is one time of the total number of outputs
+
+#### Reduce
+
+#### All Gather
+
+每个 Rank 贡献一部分数据，最后所有 Rank 都拼出一份完整的数据。Rank 0 有 $A$，Rank 1 有 $B$... 结束后，大家手里都有 $[A, B, C, D]$
+
+#### Reduce Scatter
+
+DeepSpeed ZeRO优化器核心，每个GPU只存自己负责的那一块
+
+All-Reduce 的中间步骤。它先做规约（相加），但**不把总和传给所有人**，而是把结果切开，每个 Rank 只拿一部分
+
+## Different forms of parallel LLM training
+
+### Data parallelism
+
+#### Naïve data parallel
+
+一次all reduce通信量是正在all reduce的数据量的两倍，正常来说就是 2P(N-1)/N
+
+Communication overhead – transmits 2x # params every batch
+
+![](./assets/L7_2.png)
+
+#### ZeRO levels 1-3
+
+##### level 1 shard the optimizer states and all-reduce
+
+![](./assets/L7_3.png)
+
+Each worker is responsible for updating a subset of params (corresponding to their slice) 
+
+![](./assets/L7_4.png)
+
+
+
+Memory
+
+Naive DDP (4+K) * #params 
+
+Zero (4+K/Ngpu) * #params
+
+K is optimizer states
+
+##### Level 2  shard the gradient
+
+Complexity – we can never instantiate a full gradient vector, but each worker must compute a full gradient (since we’re data parallel)
+
+![](./assets/L7_5.png)
+
+All Gather the parameters. 最后这里的All Gather就是让所有rank的model parameters进行更新
+
+##### Level 3  shard everything
+
+![](./assets/L7_6.png)
+
+Activation 占内存，如果load a layer, do a forward, free it, the memory overhead is very low. And we can do the same thing with a backward pass. After apply all-gather the parameters I need, then do reduce scatter to update after the gradients computed. Then free the weights.
+
+First All-Gather to get all parameters of this layers for the forward compute. After finished compute, free other weights.
+
+Second All-Gather is to compute backward gradient, and last Reduce-Scatter is for 梯度聚合并分发到对应分片的 GPU，用于更新
+
+FSDP has surprisingly low overhead!
+
+* Zero stage 1 is 2*# param – it’s free! – you might as well always do it
+* Zero stage 2 is 2*# param – it’s (almost) free (ignoring overhead)
+* Zero stage 3 is 3*# param – 1.5x comm cost, but that’s not bad! (ignoring latency..)
+
+Zero stage 3 is nice in principle, but can be slow and does not reduce activation memory
+
+### Model parallelism
+
+#### Pipeline parallel
+
+![](./assets/L7_7.png)
+
+Batch sizes are key to hiding the bubble – otherwise pipeline rapidly degrades perf
+
+‘Zero bubble’ pipelining
+
+#### Tensor parallel
+
+Assign columns (A1, A2) and rows (B1, B2) to separate GPUs.
+
+In the forward pass, f is the identity, and g is an all-reduce.
+
+In the backward pass, f is an all-reduce, g is the identity.
+
+and f and g is like barrier
+
+
+
+And always they used together, the pipeline parallel and tensor parallel.
+
+The only example does pipeline parallel but not tensor is DeepSeek V3 
+
+### Activation parallelism
+
+Sequence parallel
+
+## Scaling and training big LMs with parallelism
+
+Total activation memory are 
+
+![](./assets/L7_8.png)
+
+![](./assets/L7_9.png)
+
+- 选择性激活重计算：**只重新计算注意力分数矩阵**，而不存储它，可以去掉5as/h
+
+#### Rules
+
+1. Until your model fits in memory.. (model+activation in memory)
+   * Tensor parallel up to GPUs / machine
+   * Pipeline parallel across machines
+   * (Or use Zero-3, depending on **BW**)
+
+2. Then until you run out of GPUs
+   * Scale the rest of the way with data parallel (cause it is simple and works well on low bandwidth communication channels )
+
+
+
 # LMs
+
+### evaluate
+
+现代大模型训练几乎从一开始就不是 FP32 了，而是forward / backward 用 FP16 或 BF16，optimizer 里关键状态才用 FP32。
+
+Example: the 4B model
+
+the model size bf16/fp16 is 4B*2B = 8G （total 8G)
+
+full fine-tuning grad: assume grad type  bf16/fp16 4B* 2B = 8G  （total 8G)
+
+if use Adam/AdamW Optimizer, Adam 有两个一阶/二阶动量， m（一阶矩），v（二阶矩），都是fp32的，4B\*4B+4B\*4B = 32G，这是 full finetune 显存爆炸的核心原因，同时Adam/AdamW同时也会维护一份FP32 master params = 4B × 4B = 16 GB，用来更新权重，更新完再cast回FP16参数 （total 48G)
+
+Activation：和 batch size / seq len 强相关，Transformer 每层 activation 大致 ≈ `O(hidden_size × seq_len × batch)`，对 4B 模型来说activation 通常 ≥ 参数大小 8–16 GB
+
+**（total 72–80+ GB）**
 
 ![](./assets/TS1.png)
 
@@ -1428,3 +1657,162 @@ $$
 PPL 越小 → 模型越“自信” → 预测越准确
 
 PPL 越大 → 模型越“困惑” → 预测不确定性高
+
+# Experiment
+
+```python
+uv run python
+```
+
+`uv run python` ≠ “运行当前环境里的 python”，它是在“临时构造一个可复现的 Python 运行环境”
+
+### Mixed precision
+
+```python
+if use_mixed_precision and device == 'cuda':
+    autocast_context = torch.autocast(
+        device_type='cuda',
+        dtype=torch.bfloat16
+    )
+else:
+    autocast_context = nullcontext()
+```
+
+在 CUDA 上开启 AMP（Automatic Mixed Precision），让 PyTorch 自动把“适合的算子”降精度到 BF16 计算
+
+```python
+with autocast_context:
+    output = model(input)
+```
+
+**forward 内部的算子会被自动 cast 到 BF16 或 FP32**
+
+你**不用手动 `.half()` / `.bfloat16()` 每个 tensor**
+
+# Flash Attention V1,2,3 Difference
+
+| 版本   | 核心特点                                            | Memory Usage                     | 支持特性                                         | 优化方式                                                     |
+| ------ | --------------------------------------------------- | -------------------------------- | ------------------------------------------------ | ------------------------------------------------------------ |
+| **V1** | 原始 FlashAttention（Triangular masked softmax）    | **O(N×D)**，存储 QK^T            | 支持 causal mask                                 | 利用 **tiling + shared memory**，减少全矩阵 QK^T 的存储，softmax 在 tile 内计算 |
+| **V2** | 支持 **arbitrary seq_len** 和 **multi-head fusion** | 更低，部分中间结果不落显存       | 支持 variable sequence lengths，multi-head batch | **kernel fusion** + **streaming softmax**，避免全局 QK^T     |
+| **V3** | 最新版本，性能最优                                  | 最低，几乎只保留 tile 内必要数据 | 支持 **kv cache, checkpointing**, 更灵活 batch   | **pipelined tiling + async copy + fused GEMM + incremental softmax**，几乎消除了 memory bandwidth 瓶颈 |
+
+### V1
+
+目标：解决原生 PyTorch attention 的 O(N²) 显存问题。
+
+方法：按 block（tile）计算 QK^T，softmax 在 tile 内归一化。
+
+限制：只能处理固定 seq_len，multi-head 不够灵活。
+
+### V2
+
+改进了 **variable sequence length** 支持。
+
+对 multi-head batch 做 kernel fusion，减少 kernel launch。
+
+softmax 的归一化采用 streaming 方式，避免一次性存全矩阵。
+
+### V3
+
+专为 **大模型推理** 和 **kv cache** 设计。
+
+使用 **pipelined tiling + async copy** 技术，把计算和内存访问 overlap。
+
+incremental softmax：记录每个 tile 的 max value 和 sum，保证全局归一化。
+
+几乎把 memory bandwidth 限制降到最低，速度最优。
+
+# Nano-vllm
+
+```python
+from nanovllm import LLM, SamplingParams
+
+"""
+will inherit from LLMEngine
+"""
+class LLM(LLMEngine):
+  pass
+```
+
+# Cuda Graph
+
+https://developer.nvidia.com/blog/cuda-graphs/
+
+在 CUDA 中，每次 GPU 计算都是通过 **kernel launch** 或 **memory copy** 提交给 GPU 执行的。每次提交都会有 **CPU → GPU 的调度开销**（launch overhead）。当有大量小 kernel 时，这个开销可能非常显著。
+
+将一系列 GPU 操作（kernel、memcpy、events 等）预先捕获成一个“图”，然后一次性提交给 GPU 执行，避免每次提交的调度开销。
+
+* Kernel 节点：GPU kernel 执行
+
+* Memcpy 节点：内存拷贝（Host→Device, Device→Device 等）
+
+* Event 节点：同步
+
+* Empty 节点：占位，用于依赖关系管理
+
+```
+Host -> MemcpyH2D -> KernelA -> KernelB -> MemcpyD2H
+```
+
+**减少 CPU 调度开销**
+
+- 普通模式：每次 kernel launch 都要 CPU 提交到 GPU → launch overhead。
+- CUDA Graph：一次记录，多次执行，CPU 不再参与调度。
+
+**优化依赖调度**
+
+- 图中已经把 kernel 依赖关系明确表示，GPU 内部可以并行调度而无需 CPU 干预。
+
+**批量内存操作优化**
+
+- memcpy 也可以纳入图中，减少多次调用的开销。
+
+**典型场景**
+
+- Transformer 模型推理（很多小矩阵乘法 kernel）
+
+  - LLM每次generate token will have multuple GEMM (q,k,v projection + MLP + attention) 多次生成 token 速度可提升 10%~30%
+
+  ```python
+  graph = torch.cuda.CUDAGraph()
+  with torch.cuda.graph(graph):
+      output = model(input_ids)
+  graph.replay()
+  ```
+
+- 小 batch 大量迭代训练
+
+- GPU kernels 较多、每个 kernel launch 开销显著时
+
+**微批量训练（微调 LoRA / PEFT）**
+
+- 将前向 + 后向 + optimizer step 整个微批量图化
+- 重复 replay 多次 step
+- GPU 利用率提高，CPU 调度几乎为零
+
+**Graph 一旦实例化，节点形状和类型必须固定**
+
+- 比如输入 batch size、tensor shape 必须保持一致
+- 对于可变 batch，需要为每种 batch size 分别实例化 graph
+
+**不支持动态 Python 逻辑**
+
+- 例如 `if` 条件会导致不同 kernel sequence，这种情况需要用静态图或多图实例化
+
+**调试困难**
+
+- 一旦出错，graph replay 可能崩溃，需要先在普通模式下调试
+
+
+
+```c++
+kernel<<<gridDim, blockDim, sharedMemBytes, stream>>>(args...)
+```
+
+| 位置 | 参数      | 作用                              |
+| ---- | --------- | --------------------------------- |
+| 1    | `blocks`  | gridDim：有多少个 block           |
+| 2    | `threads` | blockDim：每个 block 有多少个线程 |
+| 3    | `0`       | 动态共享内存大小（字节）          |
+| 4    | `stream`  | 使用的 CUDA stream                |
