@@ -1604,7 +1604,155 @@ Total activation memory are
 2. Then until you run out of GPUs
    * Scale the rest of the way with data parallel (cause it is simple and works well on low bandwidth communication channels )
 
+# Lec 8
 
+(High Bandwidth memory) HBM larger, and each SM has L1 caches
+
+**Generalized hierarchy (from small/fast to big/slow):**
+
+* Single node, single GPU: L1 cache / shared memory
+
+* Single node, single GPU: HBM
+
+* Single node, multi-GPU: NVLink
+
+* Multi-node, multi-GPU: NVSwitch
+
+#### reduce聚合、gather收集、scatter分发
+
+Reduce: performs some associative/commutative operation (sum, min, max)
+
+Broadcast/scatter is inverse of gather
+
+All: means destination is all devices
+
+``````python
+import torch.distributed as dist
+
+setup(rank, world_size)
+
+dist.barrier() 
+
+tensor = torch.tensor([0., 1, 2, 3], device=get_device(rank)) + rank
+dist.all_reduce(tensor=tensor, op=dist.ReduceOp.SUM, async_op=False)
+
+dist.barrier()
+
+dist.reduce_scatter_tensor(output=output, input=input, op=dist.ReduceOp.SUM, async_op=False)
+
+dist.barrier()
+
+dist.all_gather_into_tensor(output_tensor=output, input_tensor=input, async_op=False)
+
+cleanup()
+``````
+
+此外benchmarking() 需要预先warm up
+
+**`spawn`** 是一个用于启动并行进程/任务的函数
+
+```python
+# All-reduce
+spawn(all_reduce, world_size=4, num_elements=100 * 1024**2)
+
+# Reduce-scatter
+spawn(reduce_scatter, world_size=4, num_elements=100 * 1024**2)
+
+# 伪代码示例
+def spawn(func, world_size=4, num_elements=...):
+    processes = []
+    for rank in range(world_size):
+        # 为每个rank创建一个进程
+        p = Process(target=func, args=(rank, world_size, num_elements))
+        processes.append(p)
+        p.start()
+    
+    for p in processes:
+        p.join()  # 等待所有进程完成
+```
+
+计算bandwidth
+
+```python
+sent_bytes = tensor.element_size() * tensor.numel()
+bandwidth = sent_bytes / total_duration
+```
+
+#### Sharding strategy: each rank gets a slice of the data
+
+Losses are different across ranks (computed on local data)
+
+Gradients are all-reduced to be the same across ranks
+
+Therefore, parameters remain the same across ranks
+
+```python
+# the SGD
+# then all reduce
+for param in params:
+  	dist.all_reduce(tensor=param.grad, op=dist.ReduceOp.AVG, async_op=False)
+```
+
+这里的all reduce可以理解为一个synchronize操作，如果有一个rank没到all reduce操作，就会hang挂起
+
+#### tensor parallelism
+
+split the layer instead of data
+
+layers are linear + activation, each gpu compute their own part of data and activate
+
+```python
+# Forward pass
+x = data
+for i in range(num_layers):
+    # Compute activations (batch_size x local_num_dim)
+    x = x @ params[i]  # Note: this is only on a slice of the parameters
+    x = F.gelu(x)
+    
+    # Allocate memory for activations (world_size x batch_size x local_num_dim)
+    activations = [torch.empty(batch_size, local_num_dim, device=get_device(rank)) for _ in range(world_size)]
+    
+    # Send activations via all gather
+    dist.all_gather(tensor_list=activations, tensor=x, async_op=False)
+    
+    # Concatenate them to get batch_size x num_dim
+    x = torch.cat(activations, dim=1)
+```
+
+#### pipeline parallelism
+
+Sharding strategy: each rank gets subset of layers, transfer all data/activations
+
+Micro-batches 就是在batch_size基础上split，减少bubble
+
+然后就是recv + send的过程，这里都是异步的
+
+```python
+dist.irecv(tensor=micro_batches[i], src=rank-1)
+
+dist.isend(tensor=x, dst=rank+1)
+```
+
+#### set up
+
+`dist.init_process_group("nccl", rank=rank, world_size=world_size)`
+
+#### clean up
+
+`torch.distributed.destroy_process_group()`
+
+#### Computer Graph vs Cuda Graph
+
+Computer Graph主要存储在CPU内存中，是框架的数据结构（Python对象）
+
+Cuda Graph是CUDA运行时级别的概念，捕获和重放一系列CUDA操作（kernel启动、内存拷贝等）
+
+**占用显存**，因为存储了：
+
+1. **内核参数**：kernel launch配置
+2. **指令缓存**：优化后的GPU指令序列
+3. **依赖信息**：操作间的依赖关系
+4. **内存池**：可能预分配的工作内存
 
 # LMs
 
