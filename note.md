@@ -1754,6 +1754,26 @@ Cuda Graph是CUDA运行时级别的概念，捕获和重放一系列CUDA操作�
 3. **依赖信息**：操作间的依赖关系
 4. **内存池**：可能预分配的工作内存
 
+# Lec 9
+
+dataset size more large, the loss smaller
+
+the compute more large, the loss smaller
+
+the parameters more large, the loss smaller
+
+### Neural (LLM) scaling behaviors
+
+how to build data? like input 5 parameters and not cancel each other, and add some noise on this point
+
+sacling law proof that use **Switch Transformers and GLU**
+
+#### Switch Transformer 
+
+Sparse Mixture-of-Experts, MoE
+
+传统 Transformer 层：每个 token 经过相同的 FFN，Switch Transformer 层：每个 token 只经过少数几个专家（通常1个）
+
 # LMs
 
 ### evaluate
