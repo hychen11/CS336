@@ -1762,6 +1762,20 @@ the compute more large, the loss smaller
 
 the parameters more large, the loss smaller
 
+### data scaling
+
+x1 to xn uniform in 2D unit box, yi  = f(xi)+N(0,1)
+
+task: estimate f(x)
+
+cut up the 3D space into boxes with length $n^{-1/4}$
+
+we have $\sqrt n$ boxes and each box gets $\sqrt n$ samples. so error around $\frac{1}{\sqrt n}$+(other smoothness terms)
+
+in d-dimension, This means scaling is 𝒚 = − 1/d 𝒙 + 𝑪
+
+Takeaway: flexible ‘nonparametric’ learning has dimension dependent scaling laws.
+
 ### Neural (LLM) scaling behaviors
 
 how to build data? like input 5 parameters and not cancel each other, and add some noise on this point
@@ -1772,7 +1786,11 @@ sacling law proof that use **Switch Transformers and GLU**
 
 Sparse Mixture-of-Experts, MoE
 
-传统 Transformer 层：每个 token 经过相同的 FFN，Switch Transformer 层：每个 token 只经过少数几个专家（通常1个）
+传统 Transformer 层：每个 token 经过相同的 FFN，Switch Transformer 层：每个 token 只经过少数几个专家（通常1个）  
+
+
+
+
 
 # LMs
 
