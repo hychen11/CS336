@@ -1788,9 +1788,132 @@ Sparse Mixture-of-Experts, MoE
 
 传统 Transformer 层：每个 token 经过相同的 FFN，Switch Transformer 层：每个 token 只经过少数几个专家（通常1个）  
 
+### model engineering
+
+#### LSTM vs Transformers
+
+#### Adam vs SGD
+
+长宽比4-16之间的近似最优都说相近的
+
+How should we allocate our limited resources?
+
+• Train models longer vs train bigger models?
+
+• Collect more data vs get more GPUs? 
+
+### Batch Size & LR
+
+Batch size – known to have strong diminishing returns past a certain point.
+
+Critical batch = min number of examples for target loss / min number of steps for target loss
+
+Critical batch the threshold between perfect scaling and inefficient scaling
+
+**The smaller the loss target, The bigger the batch**
+
+If we naively scale up – optimal learning rate depends on scale. We need scaling aware initialization and learning rate scaling
+
+### MuP
+
+当你 **改变模型宽度（hidden dim / heads / FFN）** 时：
+
+- learning rate 要重新调
+- init scale 要重新调
+- loss scale 会变
+- 梯度爆/消失风险变化
+
+**超参不可迁移**，这在 **scaling law / 大模型工程** 中是灾难性的，每换一个宽度都要重新 sweep，compute 成本爆炸
+
+muP 的做法是：**重新规定：哪些参数 scale 随宽度变，哪些不变** 让：
+
+- activations scale 稳定
+- gradients scale 稳定
+- learning rate 不依赖宽度
+
+cooling down, the learning rate is increase, and the batch size is increase as well 
+
+### Noise Scale
+
+> **Noise scale = SGD 梯度噪声的“有效温度”**
+
+- 小 noise scale → 更新稳定、能压很低的 loss
+- 大 noise scale → 抖动大、只能停在较高 loss
+
+一句话版本：
+
+> **Noise scale 决定了：你是在“精修”，还是在“带噪探索”**
+
+The scaling law based design procedure.
+
+* Train a few smaller models
+
+* Establish a scaling law (e.g. ADAM vs SGD scaling law)
+
+* Select optimal hyperparam based on the scaling law prediction.
+
+### Joint data-model scaling laws describe how the two relate
+
+### Cosine learning rate
+
+**Cosine learning rate schedule 本质上是“平滑退火到 0”**
+
+**不能随意中途截断（early stop / hard cut）**
+
+**否则等价于“瞬间升高 noise scale”，破坏训练动力学**
+
+它的设计目标不是“快降 LR”，而是：**在训练后期，连续、光滑地把系统“冷却”到 0 温度**
+
+### Chinchilla
+
+20 tokens per parameter
+
+#parameters * 20 = #tokens
+
+#tokens * #parameters = #FLOPS
+
+#### Method 1 – minimum over runs.
+
+Similar to the FLOPS figure on Kaplan the minimum over the union of all training curves is a power law.
+
+FLOPS 和 parameters size成正比，FLOPS和Tokens成正比
 
 
 
+#### Method 2 - IsoFLOPS
+
+对于不同的Compute #FLOPS，可以根据曲线的到最优的#parameters 从而的到最低的Training Loss
+
+#### Method 3 – Joint fits
+
+
+
+### 为什么在给定 compute 下，模型参数数 P 和训练 token 数 D 会存在一个“最优配比”？？
+
+**参数是“容量”，token 是“经验”**
+
+模型聪明但没见过世面，或见过世面但不够聪明，都会浪费算力
+
+- **参数太多 + token 太少** → 学不满、参数闲置、过拟合噪声
+- **token 太多 + 参数太少** → 模型饱和、继续喂数据也学不会
+
+在固定 FLOPs 下，一定存在一个平衡点。
+
+
+
+Chinchilla aims to tell you what gives the best model for fixed training compute.. But most of the compute in a real deployment is inference.. So we should ‘over’ train
+
+• GPT3 – 2 tokens / param
+
+• Chinchilla – 20 tokens / param
+
+• LLaMA65B – 22 tokens / param
+
+• Llama 2 70B – 29 tokens / param
+
+• Mistral 7B – 110 tokens / param
+
+• Llama 3 70B – 215 tokens / param
 
 # LMs
 
