@@ -1878,15 +1878,11 @@ Similar to the FLOPS figure on Kaplan the minimum over the union of all training
 
 FLOPS 和 parameters size成正比，FLOPS和Tokens成正比
 
-
-
 #### Method 2 - IsoFLOPS
 
 对于不同的Compute #FLOPS，可以根据曲线的到最优的#parameters 从而的到最低的Training Loss
 
 #### Method 3 – Joint fits
-
-
 
 ### 为什么在给定 compute 下，模型参数数 P 和训练 token 数 D 会存在一个“最优配比”？？
 
@@ -1898,8 +1894,6 @@ FLOPS 和 parameters size成正比，FLOPS和Tokens成正比
 - **token 太多 + 参数太少** → 模型饱和、继续喂数据也学不会
 
 在固定 FLOPs 下，一定存在一个平衡点。
-
-
 
 Chinchilla aims to tell you what gives the best model for fixed training compute.. But most of the compute in a real deployment is inference.. So we should ‘over’ train
 
@@ -1914,6 +1908,183 @@ Chinchilla aims to tell you what gives the best model for fixed training compute
 • Mistral 7B – 110 tokens / param
 
 • Llama 3 70B – 215 tokens / param
+
+# Lec 10
+
+### Metrics
+
+TTFT time-to-first-token: how long user waits before any generation happens
+
+Latency (seconds/token): how fast tokens appear for a user
+
+Throughput (tokens/second): useful for batch processing applications
+
+Throughtput is for a batch, and high throughput doesn't means low latency!
+
+### Efficiency
+
+Training (supervised): can see all tokens, and can parallelize over sequence
+
+Inference: generate sequentially, cannot parallelize
+
+so it is harder for inference to utilize all compute resources
+
+### Open-source package
+
+vllm
+
+tensorRT
+
+TGI
+
+### arithmetic_intensity
+
+multiply X (B x D) and W (D x F) matrix
+
+Step1: read X from HBM `2*B*D`
+
+Step2: read W from HBM `2*D*F`
+
+Step3: compute, multiply 1 flop, add 1 flop, flops +=` 2*B*F*D` 
+
+Step4: write Y to HBM `2*B*F`
+
+arithmetic intensity is the flops/data_transferred, **high is good**
+
+```python
+assert flops == 2*B*D*F
+assert bytes_transferred == 2*B*D + 2*D*F + 2*B*F
+intensity = (flops / bytes_transferred).simplify() # @inspect intensity
+```
+
+每从内存中搬运一个字节的数据，能进行多少次计算
+
+- **计算密集型任务**（如矩阵乘法、深度学习训练）的算术强度**高**。
+- **访存密集型任务**（如向量加法、稀疏矩阵操作）的算术强度**低**。
+
+H100
+
+```python
+flops_per_second = 989e12
+memory_bandwidth = 3.35e12
+accelerator_intensity = flops_per_second / memory_bandwidth # @inspect accelerator_intensity
+assert round(accelerator_intensity) == 295
+```
+
+If computation intensity > accelerator intensity, compute-limited (good)
+
+If computation intensity < accelerator intensity, memory-limited (bad)
+
+如果一个字节需要计算量超过accelerator intensity上限，就说明达到compute limit
+
+S is the number of tokens we're conditioning on, T is the number of tokens we're generating.
+
+specialize to prefill (T = S) and generation (T = 1).
+
+### MLP layers
+
+Read Wup (D x F), Wgate (D x F), Wdown (F x D) from HBM `3*2*D*F`
+
+compute flops: `6*B*T*D`
+
+`bytes_transferred == 4*B*T*D + 4*B*T*F + 6*D*F`
+
+`intensity == B*T`
+
+Prefill: easy to make compute-limited (good) by making B T large enough
+
+Generation: Generating one token at a time (T = 1), B is number of concurrent requests, hard to make large enough!
+
+### Attention layers
+
+Read Q (B x T x D), K (B x S x D), V (B x S x D) from HBM
+
+`bytes_transferred += 2*B*T*D + 2*B*S*D + 2*B*S*D`
+
+Compute A = Q (B x T x D) @ K (B x S x D)
+
+`flops += 2*B*S*T*D`
+
+Compute Y = softmax(A) (B x S x T x K x G) @ V (B x S x K x H)
+
+`flops += 2*B*S*T*D`
+
+Write Y (B x T x D) to HBM
+
+`bytes_transferred += 2*B*T*D`
+
+```python
+assert flops == 4*B*S*T*D
+assert bytes_transferred == 4*B*S*D + 4*B*T*D
+intensity = (flops / bytes_transferred).simplify() # @inspect intensity
+assert intensity == S*T / (S + T)
+```
+
+Prefill: T = S  `prefill_intensity == S/2 # Good!`  is compute limited
+
+Generation: T = 1 `generate_intensity < 1 # Bad!` is memory limited
+
+### transformer_stats
+
+number of parameters in the Transformer, the parameters store in bf16, and training requires fp32
+
+`num_params = 2*V*D + D*F*3*L + (2*D*N*H + 2*D*K*H)*L`
+
+`parameter_size = num_params * 2 # 2 for bf16`
+
+dont need gradients and optimizers since not training
+
+but need to store KV cache
+
+`kv_cache_size = S*(K*H)*L*2*2 # 2 for key+value, 2 for bf16`
+
+Total memory usage: `memory = B * kv_cache_size + parameter_size`
+
+#### Latency 
+
+is determined by memory IO (read all parameters and KV cache for each step)
+
+`latency = memory/ memory_bandwidth`
+
+#### Throughput
+
+throughput is the inverse of the latency
+
+`throughtput = B/latency`
+
+#### Tradeoff between latency and throughput:
+
+1. Smaller batch sizes yields better latency but worse throughput
+
+2. Larger batch sizes yields better throughput but worse latency
+
+### GQA
+
+group query attention
+
+N query heads, but only K key and value heads, each interacting with N/K query heads
+
+MHA K=N, each interacting with 1 query heads
+
+MQA K=1
+
+GQA K= somewhere in between 
+
+### Multi-Head latent attention (MLA)
+
+比如一个(a,k) *(k,b) 来替换(a,b) 其中k远小于a,b就可以达到这个效果
+
+也是相同思想
+
+
+
+**Goal: reduce the KV cache size (since inference is memory-limited) without hurting accuracy**
+
+**Lower-dimensional KV cache (GQA, MLA, shared KV cache)**
+
+**Local attention on some of the layers**
+
+###  
 
 # LMs
 
