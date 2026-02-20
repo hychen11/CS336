@@ -2076,15 +2076,139 @@ GQA K= somewhere in between
 
 也是相同思想
 
-
-
 **Goal: reduce the KV cache size (since inference is memory-limited) without hurting accuracy**
 
 **Lower-dimensional KV cache (GQA, MLA, shared KV cache)**
 
 **Local attention on some of the layers**
 
-###  
+# Lec 11
+
+### maximal Update(uP)
+
+对于standard parameters (SP), uP就是non-embedding layer parameter 初始化scale用了 1/width, lr 也scaled 1/width
+
+mup就是wider的MPL需要更小的lr
+
+Scale-invariant hyperparameter tuning would be very nice.
+
+How does it work, and does it work in practice?
+
+也就是对于一个model我们可以根据scale来判断它optimal的lr
+
+也就是muP是比如MiniCPM或者DeepSeek，train一个small high perf LM, 然后找到稳定放大的scale
+
+### Recent models with detailed, public scaling recipes
+
+#### Cerebras-GPT
+
+0.1B - 13B 
+
+pick hyperparameters and make sure they scale nicely
+
+#### MiniCPM
+
+scale model, not in size, but in data
+
+##### Techique 1: muP to stabilize scaling
+
+![](./assets/L11_1.png)
+
+##### Scaling recipe / strategy
+
+Use muP for initialization, fix the aspect ratio, scale up the overall model size.
+
+ aspect ratio 纵横比
+
+##### Optimal batch
+
+Data size and batch, we want to find relation in order to get minimal loss
+
+critical batch size is diminishing return point (临界批量大小大致就是收益递减的拐点)
+
+所以模型变大，loss降低，loss降低就可以使用越来越大的batch size
+
+vertical data size, horizon batch size 也就是说
+
+![](./assets/L11_2.png)
+
+##### Optimal LR
+
+muP Optimal learning rate 是类似的，对于不同的model size
+
+##### solution in miniCPM – WSD learning rate
+
+WSD 就是 Warmup+Stable+Decay
+
+**黄线 Cosine(40N)**：传统余弦调度，从一开始就缓慢弯曲下降，整个训练过程学习率都在变化
+
+**浅绿线 WSD(40N,4N)**：训练40N步，最后4N步做decay，前面全程保持稳定高学习率
+
+**深绿线 WSD(80N,8N)**：训练80N步，最后8N步做decay，**与40N版本共享同一段stable阶段的checkpoint**
+
+![](./assets/L11_3.png)
+
+节省算力
+
+最关键的insight是：**两条WSD线共享同一个stable阶段**。这意味着：
+
+- 你只需训练一次stable阶段
+- 在不同的checkpoint处触发decay，就能得到"在不同数据量下训练到最优"的模型
+- **不需要从头重新训练**来测量scaling law
+
+Cosine LRS 这个得先确定总步数，比如训练100B和200B，就得跑两次完整实验，因为余弦按照总步数比例设计的，WSD的stable阶段是"可复用的"——你只需要保存不同步数的checkpoint，然后各自触发一段decay，就能模拟"在不同数据量下训练到收敛"的效果
+
+##### Side note – other ways of estimating chinchilla curves
+
+scaling law 就是loss有下面三部分组成
+
+**E**：理论下界（不可消除的熵）
+
+**AN^{-α}**：模型太小带来的损失
+
+**BD^{-β}**：数据太少带来的损失
+
+Gadre等人把公式扩展到了**overtraining（过度训练）**场景，引入了参数 **M**（multiplier，倍数）
+$$
+L(C, M) = E + \left(aM^{\alpha_C} + bM^{-\alpha_C}\right)C^{-\alpha_C}
+$$
+The overall data-to-model ratio is very high (192), though they argue LLaMA architectures should have a higher ratio. prof说这个比例太高了
+
+#### DeepSeek
+
+##### fanin 和 fanout
+
+对于一个权重矩阵 W，连接 layer l-1 → layer l：
+
+- **fanin** = `n_{l-1}`：输入神经元数量（上一层的宽度）
+- **fanout** = `n_l`：输出神经元数量（当前层的宽度）
+
+##### 标准参数化 vs muP 对比
+
+###### 标准参数化（Standard / NTK parametrization）
+
+```
+初始化：W ~ N(0, 1/√n_{l-1})
+学习率：Θ(1)，即不随宽度变化
+```
+
+**问题所在**：当网络变宽（n 变大），forward pass 时激活值会爆炸或消失，因为矩阵乘法会累积误差。
+
+###### muP 参 数化
+
+```
+初始化：Θ(1/√n_{l-1} · min(1, √(n_l/n_{l-1})))
+学习率：n_l / n_{l-1}（SGD），1/n_{l-1}（Adam）
+```
+
+ fanout < fanin，初始化**更小**，防止激活值在这种"压缩"层爆炸
+
+总结了 muP 和标准参数化的两个关键差异：
+
+1. **LR**：Adam 优化器下 LR scaling 不同（标准是 Θ(1)，muP 是 1/n_{l-1}）
+2. **初始化**：只有当 fanout < fanin 时初始化才有区别
+
+muP 通过精心设计初始化和 LR 的 scaling 规则，保证**不管网络多宽，每一层的激活值和权重更新幅度都保持稳定**，从而实现超参数从小模型到大模型的迁移。这对 AI Infra 工程师很重要，因为它能大幅节省大模型调参的计算成本。 
 
 # LMs
 
