@@ -2358,7 +2358,29 @@ Llama-2-chat
 
 ![](./assets/L15_1.png)
 
+# Lec 16
+
+#### DPO 公式拆解
+
+$$
+\nabla_\theta \mathcal{L}_{\text{DPO}} = -\beta \mathbb{E} \Big[ \underbrace{\sigma(\hat{r}_\theta(x, y_l) - \hat{r}_\theta(x, y_w))}_{\text{weight}} \cdot \Big[ \nabla_\theta \log \pi(y_w|x) - \nabla_\theta \log \pi(y_l|x) \Big] \Big]
+$$
+
+yl 就是loser不偏好，yw就是winner就是偏好
+
+然后$\sigma$是激活函数！ σ(bad_reward - good_reward) 就是模型当前对这对偏好数据的**"困惑度"**，越困惑 → 梯度越大 → 学习越用力。这让 DPO 自动聚焦在**模型还没学好的样本**上
+
+也就是bad 大，good小这里系数越大，约接近1，所以更新越大
+
 #### GRPO
+
+目前PPO是on policy的，rollout采样很慢 
+
+![](./assets/L16_1.png)
+
+这里为什么要clip呢？为了防止一个action的到了很好的advantage，然后模型拼命增加，防止更新太猛，new policy和old policy差距过大。用clip代替KL约束
+
+ε = 0.2，所以clip范围一般限制在（0.8，1.2）
 
 这里涉及一个Critic，专门用来估计 $V(s)$ 的神经网络，但是Vs没法直接观测，只能用一个actor一样大的模型去你和，所以PPO需要两个大模型
 
@@ -2388,11 +2410,131 @@ mean(r) 本身就充当了 baseline（即 V(s) 的估计）
 
 原本PPO Actor 7B，Critic 7B，RM 7B，Ref 7B = 14*4=56GB
 
-GRPO 少了Critic = 42GB
+GRPO 少了Critic = 42GB 
 
-# Lec 16
+* Compute reward for each rollout
 
+* Mean/Var normalization per group
 
+* Compute KL term
+
+* Gradient updates on the loss
+
+https://github.com/McGill-NLP/nano-aha-moment
+
+1e-4 防止梯度爆炸
+
+### case study
+
+#### DeepSeek R1
+
+主要讲了CoT
+
+#### Kimi K1.5
+
+##### data curation+SFT
+
+Standard curation across math-style settings, balancing topics 有一个LLM的自动化标签系统，分类平衡
+
+Exclude multiple choice / true false (false positives) too easy to hack or guess，不要选择和判断
+
+Select only examples that models fail on best-of-8 用不reasoning的model也就是SFT模型产生10个答案，根据答案决定是否采纳示例
+
+> GRPO 训练需要 Group 内有**对有错**才能产生有效的 advantage 信号：
+>
+> - 全对 → advantage 全为 0 → 梯度为 0 → 白费
+> - 全错 → 没有正向信号 → 模型学不到什么
+> - **有对有错 → 对比信号最强 → 训练最有效**
+>
+> **留下 SFT model 偶尔会错的题**，这类题对 RL 训练的信噪比最高。太简单的题产生不了有效梯度，直接丢掉节省算力。
+
+##### RL
+
+![](./assets/L16_2.png)
+
+第一部分是base r就是均值，第二部分不是clip（GRPO）而是规范化策略？
+
+##### Length control
+
+lambda = 0.5-(len(i)-min_len)/(max_len-min_len) range from [-0.5, 0.5]
+
+##### RL Infra
+
+On policy = rollouts, which means (slow) inference （核心的bottleneck，rollout）
+
+Switching from training to rollouts often means different frameworks （RL和inference switch，passing data back to RL, RL pass weight to inference server)
+
+Long CoTs can make batches very uneven.
+
+rollout（推理采样）→ 计算reward → 训练更新 → 再rollout → ...
+
+朴素做法是训练和推理用**不同的 GPU 集群**，但这样资源利用率低——训练时推理卡闲着，推理时训练卡闲着。
+
+Kimi 的方案是**同一批 GPU 交替跑 Megatron（训练）和 vLLM（推理）**，但两者的内存布局完全不同，不能同时驻留显存。
+
+```
+[Training Phase]
+  Megatron 训练
+  → 训练完成，offload 权重到 CPU
+  → 等待 vLLM rollout
+
+[Inference Phase]
+  vLLM 用 dummy weights 启动（占位）
+  → 从 Megatron 拿最新权重（via Mooncake/RDMA）
+  → Update weight，开始 rollout 采样
+  → rollout 完成，terminate vLLM，释放显存
+
+[Subsequent Training Phase]
+  Megatron onload 权重回 GPU
+  → 开始下一轮训练
+```
+
+**Checkpoint Engine（shim 进程）**
+
+- 同时被 Megatron 和 vLLM 两侧持有
+- 负责协调权重的 Register / Update / Shared Memory 操作
+- 是两个容器之间的**桥梁进程**
+
+**Shared Memory**
+
+- Megatron offload 后权重先落到 Shared Memory
+- vLLM 从这里读取最新权重做 Update Weight
+- 避免走网络，同节点内零拷贝
+
+**RDMA + etcd**
+
+- 跨 Pod 的权重传输走 RDMA（高带宽低延迟）
+- etcd 做服务发现和状态同步，协调多个 Pod 的进度
+
+**Mooncake**
+
+- Kimi 自研的传输层，负责大规模权重的高效搬运
+
+**Dummy Start**
+
+- vLLM 启动时先用 dummy（随机/空）权重占好显存
+- 等 Megatron 传过来真实权重再 Update
+- 避免 vLLM 冷启动的显存分配延迟
+
+> 训练阶段：  Megatron 占用全部 GPU 显存  vLLM 进程存在，但显存已释放（不占显存） 推理阶段：  Megatron offload 到 CPU → GPU 显存释放  vLLM 重新申请显存 → 加载新权重 → rollout
+>
+> Megatron 训练完成  ↓ 开始 offload 权重到 CPU        ──┐ 同时：vLLM 开始申请显存(dummy)  ──┘  并行进行！ offload 完成 + vLLM 显存ready  ↓ 权重通过 Shared Memory/RDMA 传给 vLLM  ↓ vLLM 覆写显存中的 dummy 权重 → rollout
+>
+>  也就是offload和vllm initial可以并行，dummy start
+>
+> offload是分批次的，offload完再free，再vllm申请这块free的空间，填dummy权重，但是需要cuda异步内存操作
+>
+>  ````
+>  cudaMemcpyAsync(cpu_buf, gpu_buf, size, D2H, stream1)
+>  // stream1 在传输，stream2 可以同时做别的事情
+>  // 传输完成后 callback：free gpu_buf，通知 vLLM 可以申请
+>  ````
+
+#### Qwen 3
+
+thinking mode fusion, think and no think tag
+
+So this tag can control thinking token
 
 # Lec 17
 
