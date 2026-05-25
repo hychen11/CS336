@@ -2138,7 +2138,90 @@ muP Optimal learning rate 是类似的，对于不同的model size
 
 ##### solution in miniCPM – WSD learning rate
 
-WSD 就是 Warmup+Stable+Decay
+WSD 就是 **Warmup+Stable+Decay** 来自miniCPM，解决了cosine decay的根本缺陷
+
+* Warm up 让优化器"找到方向"，避免初期大 lr 破坏随机初始化的参数
+
+  ```
+  lr = max_lr * (current_step / warmup_steps)
+  ```
+
+  - 步数占比极小（~1%）
+  - 从接近 0 线性增到 max_lr
+  - Adam 的二阶矩估计（$v_t$）在初期不稳定，小 lr 防止梯度爆炸
+
+  **本质：** 优化器冷启动问题，和模型知识无关。
+
+* Stable
+
+  ```
+  lr 保持恒定（不衰减！）
+           ↓
+  模型处于"持续学习"状态
+           ↓
+  可以随时插入新数据、调整配比
+           ↓
+  Checkpoint 可以随时 branch 出去做 Decay
+  ```
+
+  lr并不是必须衰减才收敛，lr不变loss还是可以下降，只不过比decay后高一点
+
+  模型在持续吸收知识，只是还没"压缩整理"。
+
+  ```
+  Stable Checkpoint @ step N
+          ├── Branch A: 再跑 10B tokens → Decay → 发布小版本
+          ├── Branch B: 换领域数据 → Decay → 领域模型
+          └── Branch C: 继续 Stable → 更大版本
+  ```
+
+
+* Decay
+
+  让模型"消化整理"已学到的知识
+
+  ```
+  # cosine decay from max_lr to ~0
+  lr = max_lr * 0.5 * (1 + cos(π * t / decay_steps))
+  ```
+
+  ```
+  Stable 阶段：
+    参数在高 lr 下持续大幅跳动
+    → 探索了大量参数空间
+    → 知识"松散"地分布在权重里
+  
+  Decay 阶段：
+    lr 降低 → 更新步长缩小
+    → 参数收敛到当前 loss basin 的底部
+    → 知识被"压实"进参数
+    → Loss 快速下降
+  ```
+
+##### WSD example
+
+三个 branch 共享了 50k steps 的训练成本，不需要各自从头跑
+
+```
+Step 0                    Step 50k              Step 55k
+│                         │                     │
+▼                         ▼                     ▼
+Warmup ──────────────── Stable ──── ... ──── Stable
+                            │
+                     Checkpoint @ 50k
+                     (这是你的"资产")
+                            │
+               ┌────────────┼────────────┐
+               ▼            ▼            ▼
+           Branch A      Branch B      Branch C
+           再跑10B        换金融数据     继续跑
+           通用数据        Decay         50k步
+           → Decay        → 金融模型    → 更强基座
+           → v1.0发布
+
+```
+
+但是这里换dataset训会有spike，但是正常
 
 **黄线 Cosine(40N)**：传统余弦调度，从一开始就缓慢弯曲下降，整个训练过程学习率都在变化
 
@@ -2209,6 +2292,454 @@ The overall data-to-model ratio is very high (192), though they argue LLaMA arch
 2. **初始化**：只有当 fanout < fanin 时初始化才有区别
 
 muP 通过精心设计初始化和 LR 的 scaling 规则，保证**不管网络多宽，每一层的激活值和权重更新幅度都保持稳定**，从而实现超参数从小模型到大模型的迁移。这对 AI Infra 工程师很重要，因为它能大幅节省大模型调参的计算成本。 
+
+# Lec 15
+
+### training data
+
+ FLAN
+
+Oasst
+
+Aplaca
+
+Takeaways on knowledge extraction and alignment
+
+1. You may not want to fine-tune on tail knowledge, even that’s the LM use case（Pretrain 时 tail knowledge 见得少 → 表示很弱、不稳定，Tail knowledge 用 **RAG / tool use** 来补，而不是 fine-tune 进参数里）
+2. In principle, ‘RL’ style correctness feedback could help
+3. Knowledge storage and extraction in LMs is messy, and nuanced. （知识以分布式、叠加的方式编码在权重里，提取受到 prompt 格式、上下文、语言、temperature 影响，同一个知识，问法不同 → 结果可能完全不同）
+
+pre training 传授知识
+
+post training可以学知识吗？可能可以，但是dataset量不足以支持
+
+### method (How to fine-tune mainly gradient descent)
+
+rollout就是model跑一遍输出
+
+InstructGPT的共识，第一项R(x,y)就是reward，第二项是RL和SFT的kl散度，第三项gamma
+
+
+
+On-Policy:   用"当前模型"自己生成的数据来训练自己 
+
+Off-Policy:  用"别人/旧版本"生成的数据来训练
+
+#### PPO
+
+* reward model r_theta(x,y) prompt x, response y, output score
+
+  > 第一项是**在线采样（on-policy）**，这也是 PPO 训练最贵的地方——每次更新参数后都要重新生成 response 来估计期望，这就是为什么后来 GRPO、DPO 想方设法去掉这个在线采样的需求
+
+* RL与STF的KL散度，让RL不要离SFT太远，有beta控制
+
+  β 大 → KL 惩罚强，模型更保守，接近 SFT β 小 → 模型更激进地追求 reward，容易 hacking
+
+  然后这个是token级别的，每个token都计算KL （per-token KL)
+
+* 最后一个是0
+
+```
+r_θ(x,y)              想最大化 reward（可能 hacking）
+    ↑对抗↓
+-β·KL(π_RL||π_SFT)    想让模型别跑太远（保持对齐）
+
+最终平衡点：
+reward 高 且 和 SFT 差距不太大 的 response
+```
+
+#### DPO (Direct Preference Optimization)
+
+Llama-2-chat
+
+不需要显式训练RM，在用RL优化Actor
+
+对上面的公式直接求最优解，带入loss后把RL转为maximum likelihood problem了
+
+![](./assets/L15_1.png)
+
+#### GRPO
+
+这里涉及一个Critic，专门用来估计 $V(s)$ 的神经网络，但是Vs没法直接观测，只能用一个actor一样大的模型去你和，所以PPO需要两个大模型
+
+```
+Q(s,a)：在状态 s 采取动作 a 之后的期望总回报
+V(s)  ：在状态 s 下，平均能拿到多少回报（baseline）
+
+Advantage > 0：这个动作比平均水平好
+Advantage < 0：这个动作比平均水平差
+```
+
+GRPO就是用组内相对表现代替Vs
+
+对同一个 prompt $x$，采样 $G$ 个输出：
+$$
+\{y_1, y_2, y_3, ..., y_G\} \sim \pi_\theta(\cdot | x)
+$$
+每个输出得到 reward：
+$$
+\{r_1, r_2, r_3, ..., r_G\}
+$$
+然后组内归一化：
+$$
+\hat{A}_i = \frac{r_i - \text{mean}(\mathbf{r})}{\text{std}(\mathbf{r})}
+$$
+mean(r) 本身就充当了 baseline（即 V(s) 的估计）
+
+原本PPO Actor 7B，Critic 7B，RM 7B，Ref 7B = 14*4=56GB
+
+GRPO 少了Critic = 42GB
+
+# Lec 16
+
+
+
+# Lec 17
+
+
+
+# RL
+
+SFT的本质是什么？SFT 的 loss 和 pre-training **完全一样**，都是 cross-entropy
+
+```
+Pretraining        SFT              RLHF/DPO
+────────────       ──────────       ──────────────────
+构建特征空间         激活 IF 行为      精细化 preference
+注入世界知识         格式对齐          拒绝有害输出
+学习语言分布         少量数据够用      需要更多覆盖度
+                    泛化靠 pretrain   泛化靠 reward model
+
+                         ↓
+              最终泛化能力的上限 = Pretrain 的质量
+Loss: next token    Loss: supervised    Loss: reward signal
+prediction          imitation
+```
+
+```python
+# Pre-training: 对所有 token 都算 loss
+loss = CrossEntropy(logits, all_tokens)
+
+# SFT: 只对 response 部分算 loss（input/instruction 部分 mask 掉）
+loss = CrossEntropy(logits, response_tokens_only)
+#                                ↑
+#              这是 SFT 和 pre-training 最核心的区别
+# [INST] 帮我写一个排序算法 [/INST]  →  这段 mask，不算 loss
+# 这是一个冒泡排序...                →  这段算 loss，监督模型输出
+```
+
+ SFT 并不是在"教模型新知识"，而是在 reshape 模型的输出分布
+
+SFT做了什么，从续写变到指令
+
+```
+Before SFT:
+  Input:  "写一首诗"
+  Output: "写一首诗的技巧有很多，首先..." （续写风格）
+
+After SFT:
+  Input:  "写一首诗"
+  Output: "春风吹绿江南岸..."             （执行指令）
+```
+
+缩小输出空间，Pre-training 学到的是**整个互联网的分布**（广但杂），SFT 用高质量 demo 把分布**拉向特定行为空间**
+
+```
+Pre-training 分布:
+  P(output | input) ← 覆盖所有可能的"合理续写"
+
+SFT 之后:
+  P(output | input) ← 向 demonstration 数据的分布靠拢
+                       （helpful, formatted, role-aware）
+```
+
+激活已有能力
+
+**模型的能力在 pre-training 就已经学会了**，SFT 只是教模型"什么时候、用什么格式把能力表现出来"。
+
+这也是为什么少量高质量 SFT 数据（1k~10k 条）就能显著改变模型行为的原因。
+
+SFT里数据质量是核心
+
+#### SFT 的局限性（为什么还需要 RLHF）
+
+| 问题                      | 原因                                           |
+| ------------------------- | ---------------------------------------------- |
+| **Behavior cloning 上限** | 模型只能模仿 demo，无法超越 demonstration 质量 |
+| **分布外泛化差**          | 没见过的指令格式容易失效                       |
+| **无法优化"好坏"**        | SFT 不知道两个回答哪个更好，只是 imitation     |
+| **Reward hacking 风险**   | 模型学会"看起来像好答案"而不是"真的是好答案"   |
+
+这就是为什么 SFT 之后还需要 **RLHF/RLAIF**：
+
+```
+SFT:  "模仿人类写的答案"
+RLHF: "优化人类更喜欢哪个答案"  ← 有质量信号的反馈
+```
+
+```
+# 关键超参数
+learning_rate = 1e-5 ~ 5e-5   # 比 pre-training 小 10-100x
+                                # 防止 catastrophic forgetting
+epochs = 1 ~ 3                 # 太多会过拟合 demo 数据
+warmup + cosine decay          # 标准 LR schedule
+
+# 常用技术
+LoRA / QLoRA    # 只微调低秩矩阵，参数量降低 100x+
+Gradient ckpt   # 节省显存
+Flash Attention # 长 context 必备
+```
+
+FFT & PEFT
+
+少量数据更新
+
+```
+# 模型所有参数都参与梯度计算和更新
+for name, param in model.named_parameters():
+    param.requires_grad = True   # 全部解冻
+
+optimizer = AdamW(model.parameters(), lr=2e-5)
+
+# 前向传播
+output = model(input_ids, attention_mask)
+loss = cross_entropy(output.logits, labels)  # 只对 response token 算
+
+# 反向传播 → 更新所有权重
+loss.backward()
+optimizer.step()
+```
+
+7B model fp16 7B*2bytes=14GB, activation 7B\*2bytes=14GB, AdamW 7B\*(4+4)=56GB, total 84GB Adam 优化器是显存杀手
+
+一个 epoch 大概率够了，但原因反直觉
+
+```
+Pre-training:   epoch 很多，因为要从随机初始化"学会"一切
+FFT:            模型已有强大先验，只需要"激活/调整"行为
+```
+
+PEFT **预训练模型做任务适应时，权重的变化是低秩的（low intrinsic rank）** —— LoRA 论文（Hu et al. 2021）
+
+FFT 时虽然所有参数都在动，但**有效的信息变化维度很低**，大量更新是冗余的
+
+```
+FFT:   W_new = W_0 + ΔW
+              其中 ΔW ∈ R^(d×k)，参数量 = d×k
+
+LoRA:  W_new = W_0 + BA
+              其中 B ∈ R^(d×r), A ∈ R^(r×k)，r << min(d,k)
+              参数量 = d×r + r×k = r(d+k)
+
+压缩比：
+  d=4096, k=4096, r=16
+  FFT:  4096 × 4096 = 16,777,216 参数
+  LoRA: 16 × (4096+4096) = 131,072 参数
+  → 压缩 128x
+```
+
+d*k
+
+d*r+r\*k = (d+k)\*r
+
+```python
+#TODO 手搓一个LoRA
+import torch
+import torch.nn as nn
+
+class LoRALinear(nn.Module):
+    def __init__(self, original_linear, r=16, alpha=32):
+        super().__init__()
+        d, k = original_linear.weight.shape
+        self.original = original_linear
+        self.r = r
+        self.scale = alpha / r           # scaling factor
+
+        # 冻结原始权重
+        for p in self.original.parameters():
+            p.requires_grad = False
+
+        # 只训练这两个小矩阵
+        self.A = nn.Parameter(torch.randn(r, k) * 0.01)  # 随机初始化
+        self.B = nn.Parameter(torch.zeros(d, r))          # 零初始化 ← 关键！
+
+    def forward(self, x):
+        # W_0·x  +  (B·A)·x × scale
+        return self.original(x) + (x @ self.A.T @ self.B.T) * self.scale
+
+# B 初始化为 0 的原因：
+# 训练开始时 ΔW = B·A = 0，不破坏预训练模型的输出
+# 相当于从一个"干净"的起点开始微调
+```
+
+LoRA加在哪里？ Wq，Wk，Wv，Wo
+
+QLoRA：显存再砍一半
+
+```
+LoRA:  fp16 加载模型权重 + 训练 LoRA 矩阵
+QLoRA: NF4 量化加载模型权重 + fp16 LoRA 矩阵 + 计算时动态反量化
+
+7B 模型显存对比：
+  FFT:    ~84 GB
+  LoRA:   ~30 GB
+  QLoRA:  ~10 GB  ← 单张 3090/4090 可跑！
+```
+
+Learning Rate
+
+```
+Pre-training LR:  1e-4 ~ 3e-4
+SFT LR:           1e-5 ~ 5e-5   (小 10-100x)
+
+原因 —— Loss landscape 视角：
+
+Pre-training 后模型已在一个"好的"loss 谷底
+                    ↓
+SFT 数据量小，大 LR 会把模型踢出谷底
+                    ↓
+            灾难性遗忘 (Catastrophic Forgetting)
+            模型忘记 pre-training 学到的知识
+
+小 LR = 在谷底附近小步调整，不破坏已有能力
+```
+
+Warmup + Cosine Decay：LR Schedule
+
+```
+def get_lr(step, total_steps, warmup_steps, max_lr, min_lr):
+    # Phase 1: Linear Warmup
+    if step < warmup_steps:
+        return max_lr * (step / warmup_steps)
+
+    # Phase 2: Cosine Decay
+    progress = (step - warmup_steps) / (total_steps - warmup_steps)
+    return min_lr + 0.5 * (max_lr - min_lr) * (1 + cos(π * progress))
+
+# 为什么 warmup？
+# 训练初始梯度不稳定，直接大 LR 会震荡
+# warmup 让优化器先"热身"，积累可靠的梯度统计
+```
+
+Gradient Checkpointing：时间换空间
+
+```
+正常前向传播：保存所有中间激活值（用于反向传播）
+  显存：O(层数)  速度：快
+
+Gradient Checkpointing：只保存关键节点的激活值，其余重算
+  显存：O(√层数)  速度：慢约 30-40%
+
+# 开启方式
+model.gradient_checkpointing_enable()
+```
+
+Flash Attention：计算重构
+
+```
+标准 Attention 瓶颈：
+  QK^T 矩阵：(seq_len × seq_len)，长序列时爆显存
+  seq=4096: 4096×4096×2bytes ≈ 32MB（每层每头）
+
+Flash Attention 思路：
+  分块计算（tiling），避免具现化完整 attention 矩阵
+  IO-aware：最大化利用 SRAM，减少 HBM 读写
+  
+效果：
+  显存 O(n²) → O(n)
+  速度提升 2-4x（IO bound 变 compute bound）
+```
+
+SFT 使用框架 LLaMA-Factory  支持几乎所有开源模型，配置驱动，工业常用
+
+
+
+policy + reward
+
+SFT（监督微调）→ GRPO（数学推理 RL）→ DPO（可选，偏好对齐）
+
+RLHF (InstructGPT) SFT->RM->PPO reward 人类偏好
+
+DPO 绕开 reward model直接从偏好数据学更稳定简单
+
+RLVR / GRPOreward = 答案对/错无需人类标注DeepSeek-R1 核心
+
+**Agent（智能体）**：做决策的主体。在 LLM 场景里，模型本身就是 agent。
+
+**Environment（环境）**：agent 交互的世界。在 LLM 场景里，"环境"是人类或自动评分系统。
+
+**State s（状态）**：当前的观测。对 LLM 来说，状态 = 当前的 prompt + 已生成的 token。
+
+**Policy π(a|s)（策略）**：给定状态，选择动作的概率分布。LLM 的 policy 就是 `P(下一个token | 之前所有token)`，也就是模型本身。
+
+**Reward r（奖励）**：做完动作后得到的反馈信号。这是 RL 和监督学习最本质的区别——reward 可以很稀疏，可以延迟，可以来自人类打分，也可以来自程序验证。
+
+### alignment (InstructGPT)
+
+**第一阶段 SFT（监督微调）**：收集人类写的好回答，用监督学习微调模型。告诉模型"这种风格是好的"。
+
+**第二阶段 RM（奖励模型）**：让人类对多个回答排序，训练一个 reward model 来预测人类偏好分数。相当于把人类偏好"固化"成一个打分函数。
+
+**第三阶段 PPO（强化学习）**：用 RM 的分数作为 reward，用 PPO 算法继续训练 LLM。模型通过不断生成→评分→更新，学会输出更符合人类偏好的回答。
+
+RLHF 有个痛点：**reward model 本身可能训偏**。模型会学会"哄骗" reward model（reward hacking），而不是真正变好。而且训练 RM 需要大量人类标注，成本很高，需要同时维护 4 个模型（SFT, RM, Actor, Ref）训练不稳定，reward hacking工程复杂度极高
+
+GRPO/RLVR reward 来自"数学答案对不对"这种程序可以自动验证的信号，不需要人类打分，也不需要 reward model，干净得多
+
+DPO 只需 2 个模型（π\_θ, π\_ref）训练稳定，无 RL 波动一个 loss 函数搞定实现极简，效果接近
+
+### Generalization
+
+学知识是在pretrain里，SFT是激活，路由，格式化pretrain学习到的能力
+
+即 instruction-following 的 surface behavior
+
+```
+Layer 1：特征空间已经构建好了
+Pretrain 之后，模型的 representation space 已经把语义、知识、推理都编码进去了。
+SFT 的 gradient update 主要在：
+
+调整 attention 的 routing（哪些 head 被激活）
+调整输出层的分布（从 next-token prediction 转向 instruction following）
+不怎么改动中间层的知识表示
+
+Layer 2：泛化来自 Pretrain 的 in-context generalization
+Pretrain 见过海量的 QA 对、对话、指令文本（StackOverflow、Reddit、书籍...），只是没有经过 instruction-following 的 alignment。
+SFT 相当于给模型一把钥匙，让它知道"遇到这种输入格式，激活对话模式"。
+
+Layer 3：数据质量 >> 数量
+泛化的关键不是数据量，而是覆盖行为空间的多样性：
+```
+
+
+
+https://claude.ai/share/27f8294b-852d-436a-9f8f-7687dfb107e1
+
+```
+可以做的 MLsys 研究：
+
+① CUDA Kernel 优化
+   写 FlashAttention / Fused Kernels
+   显存大小不是关键，理解内存层级才是
+   4060 一样有 L1/L2/SMEM/HBM 层级
+   sm_89 架构，完全够学习
+
+② 量化 (Quantization)
+   INT8 / INT4 / GPTQ / AWQ 实现
+   在小模型上验证方法，结论可以迁移到大模型
+
+③ 推理引擎
+   KV Cache 优化, Continuous Batching
+   PagedAttention (vLLM 核心思想)
+   可以在小模型上完整复现
+
+④ 编译优化
+   Triton 写算子
+   torch.compile 的行为分析
+   这些跟显存大小关系不大
+```
+
+
 
 # LMs
 
@@ -2420,3 +2951,29 @@ kernel<<<gridDim, blockDim, sharedMemBytes, stream>>>(args...)
 | 2    | `threads` | blockDim：每个 block 有多少个线程 |
 | 3    | `0`       | 动态共享内存大小（字节）          |
 | 4    | `stream`  | 使用的 CUDA stream                |
+
+# MLE
+
+maximum likelihood 
+
+Cross Entropy Loss 和 MLE 是同一件事
+
+```
+最大化 log P(data | θ)
+    ≡
+最小化 -log P(data | θ)
+    ≡
+最小化 Cross Entropy Loss
+```
+
+DPO 的 loss 本质上也是一个 MLE，只是在"偏好对"上做的：
+$$
+\mathcal{L}_{DPO} = -\log \sigma \left( \beta \log \frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)} \right)
+$$
+
+## InstructGPT
+
+- Abstract + Introduction（搞清楚 SFT → RM → PPO 三阶段）
+- Section 3.1（SFT 数据和训练方式）
+- Figure 2（整体流程图，看懂这张图就理解了 RLHF 全貌）
+- 可以跳过 Section 4-5 的实验细节
