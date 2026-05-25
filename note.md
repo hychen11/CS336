@@ -2538,7 +2538,110 @@ So this tag can control thinking token
 
 # Lec 17
 
+我们想最大化期望奖励：
+$$
+E[R] = \int p(s) \cdot \pi(a|s) \cdot R(s,a) \, da \, ds
+$$
+这里 $p(s)$ 是 prompt 的分布（固定，不可控），$\pi(a|s)$ 是策略（我们能控制的参数 $\theta$），$R(s,a)$ 是奖励
 
+求导就是
+
+对任意函数 $f$，复合函数求导：
+$$
+\frac{d}{dx} \log f(x) = \frac{f'(x)}{f(x)}
+$$
+用恒等式：
+$$
+\nabla \pi(a|s) = \pi(a|s) \cdot \frac{\nabla \pi(a|s)}{\pi(a|s)} = \pi(a|s) \cdot \nabla \log \pi(a|s)
+$$
+这就是 **log-derivative trick**，代入：
+$$
+\nabla E[R] = \int p(s) \cdot \pi(a|s) \cdot \nabla \log \pi(a|s) \cdot R(s,a)
+$$
+
+#### SFT 的 Loss 是什么？
+
+SFT (Supervised Fine-Tuning) 就是标准的语言模型训练，最大化正确答案的对数概率：
+$$
+\mathcal{L}_{SFT} = \mathbb{E}_{(s,a) \sim \text{dataset}}[\log \pi(a|s)]
+$$
+对参数求梯度：
+$$
+\nabla \mathcal{L}_{SFT} = \mathbb{E}[\nabla \log \pi(a|s)]
+$$
+展开到 token 级别（LLM 是自回归的）：
+$$
+= \mathbb{E}\left[\sum_{t=1}^{T} \nabla \log \pi(a_t | s, a_{<t})\right]
+$$
+
+#### Policy Gradient 的更新是什么？
+
+$$
+\nabla E[R] = \mathbb{E}[\nabla \log \pi(a|s) \cdot R(s,a)]
+$$
+
+展开：
+$$
+= \mathbb{E}\left[\sum_{t=1}^{T} \nabla \log \pi(a_t | s, a_{<t}) \cdot R(s,a)\right]
+$$
+SFT vs RL， 也就是SFT本质上每条数据权重相同为1，Policy Gradient 奖励作为权重 R(s,a)
+
+#### Naive policy gradient:
+
+Sample prompt s, sample response a ~ π(a | s)
+
+Update parameters based on ∇ log π(a | s) R(s, a) (same as SFT, but weighted by R(s, a))
+
+Challenge: high noise/variance
+
+In this setting, sparse rewards (few responses get reward 1, most get 0) 无法梯度更新
+
+In contrast: in RLHF, reward models (learned from pairwise preferences) are more continuous
+
+这里dataset changing over time as policy changes 就是更新完梯度后下次采样，回答会不同，来自新模型
+
+这里reward 0-1 不太好，因为0到话梯度为0，什么都不做了，所以要有baseline，reward = R - b，减去baseline 期望梯度不变，方差降低
+
+方差降低，每步更新方向基本正确 → 可以用更大 learning rate → 更少样本就能准确估计梯度 → 收敛快且稳定
+
+噪声大（高方差）→ 某次更新方向完全错误 → 需要更小的 learning rate 才能稳定 → 需要更多样本才能平均掉噪声 → 收敛慢，甚至发散
+
+注意这里模型随机选择！不随机就学不到东西了训练阶段 vs 推理阶段
+
+```
+推理阶段（你平时用）：
+  → 通常用 greedy / beam search 取概率最高的
+  → 看起来"确定"
+
+训练阶段（RL）：
+  → 必须用采样！temperature > 0
+  → 故意引入随机性，探索不同 action
+  → 没有随机性就没法探索，没法探索就没法学习
+```
+
+Example: two states
+
+s1: a1 → reward 11, a2 → reward 9
+
+s2: a1 → reward 0, a2 → reward 2
+
+Don't want s1 → a2 (reward 9) because a1 is better, want s2 → a2 (reward 2), but 9 > 2，会随机选到a2
+
+Idea: maximize the baselined reward: E[R - b(s)]
+
+#### Advantage functions
+
+* V(s) = E[R | s] = expected reward from state s
+
+* Q(s, a) = E[R | s, a] = expected reward from state s taking action a
+
+Q and R are the same here, because we're assuming a has all actions and we have outcome rewards.
+
+Definition (advantage): A(s, a) = Q(s, a) - V(s)
+
+Intuition: how much better is action a than expected from state s
+
+然后就简单介绍了下GRPO的简单实现和代码
 
 # RL
 
