@@ -3288,6 +3288,61 @@ r(y∣x)⋅∇θlogπθ(y∣x) 的含义：
 - **Sampling**：生成 $y_i$ 来做 Monte Carlo 估计
 - **Scoring**：计算 $\log \pi_\theta(y_i|x_i)$ 来求梯度
 
+#### GRPO
+
+**梯度是对 loss 标量求的**
+
+PyTorch 里 `.backward()` 要求起点必须是一个**标量**。你有一个模型参数 θ，loss 是一个数，梯度就是"改变 θ 的每个分量，loss 会怎么变"。
+
+所以不管你的数据有多少个 token、多少条序列，最终必须归结成**一个数**才能求梯度。
+
+**为什么说"原本是 per-sequence"**
+
+```
+J = (1/BG) * Σ_i Σ_j  [  (1/len) * Σ_t  A * log π  ]
+              ↑序列层                  ↑token层
+```
+
+最外面两个 Σ 在对 B 个 prompt、G 个 response 求和，最里面的 Σ_t 在对每条 response 的所有 token 求和。
+
+最终 J 是一个标量。这个标量对 θ 求梯度，链式法则会自动把每个 token 的贡献都算进去。
+
+所以"per-sequence"的意思是：**J 本身是把所有 token 都加起来之后的一个数**，不是每个 token 单独一个数。
+
+------
+
+**那为什么还需要 per-token？**
+
+问题出在**变长序列 + padding**。
+
+实际训练时，一个 batch 里不同 response 长度不同，短的会被 pad 到一样长：
+
+```
+response 1: [我 是 猫 <pad> <pad>]
+response 2: [今 天 天 气  真   好]
+```
+
+如果你直接对整个矩阵求 mean，pad 位置也会贡献梯度，这是错的。
+
+per-token loss 的意思是：先算出每个位置的 loss 值，然后**只对真实 token 的位置做 mask，再 aggregate**：
+
+```python
+# per_token_loss shape: (batch, seq_len)
+per_token_loss = advantage * log_prob  # 每个位置一个值
+
+# mask 掉 padding
+per_token_loss = per_token_loss * token_mask  # pad 位置变 0
+
+# 再 aggregate 成标量
+loss = per_token_loss.sum() / token_mask.sum()
+```
+
+如果你直接在 sequence 层面操作，就很难干净地处理这个 mask。
+
+**一句话总结**
+
+数学上 J 是个标量（per-sequence 求和完的结果），梯度对它求就够了。但工程实现时，你需要先保留 per-token 的中间结果，mask 掉 padding 之后再 aggregate，否则 pad token 会污染梯度。
+
 # einops 快速入门
 
 核心规则：相同字母 = 相同语义，不同字母 = 不同语义
