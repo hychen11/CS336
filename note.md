@@ -3222,3 +3222,295 @@ $$
 - Section 3.1（SFT 数据和训练方式）
 - Figure 2（整体流程图，看懂这张图就理解了 RLHF 全貌）
 - 可以跳过 Section 4-5 的实验细节
+
+# Assignment 5
+
+直觉上，我们想对 $J_\theta$ 求梯度然后做梯度上升。但问题是：
+
+```
+J_θ = E_{y~π_θ}[r(y|x)]
+         ↑
+    y 是从 π_θ 采样的
+    采样操作不可微！
+    无法直接用 autograd 反传
+```
+
+#### log-derivative trick
+
+固定 $x$，只看内层期望对 $\theta $ 求梯度：
+
+**第一步**：把期望展开成积分
+$$
+\nabla_\theta E_{y\sim\pi_\theta}[r(y|x)] = \nabla_\theta \int \pi_\theta(y|x) \cdot r(y|x) \, dy
+$$
+**第二步**：梯度移进积分（Leibniz rule）
+$$
+= \int \nabla_\theta \pi_\theta(y|x) \cdot r(y|x) \, dy
+$$
+**第三步**：用恒等式 $\nabla_\theta \pi_\theta = \pi_\theta \cdot \nabla_\theta \log \pi_\theta$
+
+> 因为 $\nabla \log f = \frac{\nabla f}{f}$，所以 $\nabla f = f \cdot \nabla \log f$
+
+$$
+= \int \pi_\theta(y|x) \cdot \nabla_\theta \log \pi_\theta(y|x) \cdot r(y|x) \, dy
+$$
+
+**第四步**：重新写回期望形式
+$$
+= E_{y\sim\pi_\theta(y|x)}[r(y|x) \cdot \nabla_\theta \log \pi_\theta(y|x)]
+$$
+
+#### 变换的本质意义
+
+```
+变换前：∇_θ E_{y~π_θ}[r]        ← 梯度在期望"外面"，无法采样估计
+变换后：E_{y~π_θ}[r · ∇_θ log π_θ]  ← 梯度在期望"里面"，可以 Monte Carlo 估计！
+```
+
+现在梯度变成了一个**期望**，可以用采样来近似：
+$$
+\nabla_\theta J_\theta \approx \frac{1}{N} \sum_{i=1}^{N} r(y_i|x_i) \cdot \nabla_\theta \log \pi_\theta(y_i|x_i)
+$$
+r(y∣x)⋅∇θlogπθ(y∣x) 的含义：
+
+```
+如果 y 答对了（r=1）：
+    → 增大 log π_θ(y|x)，即提高模型生成 y 的概率
+    → 相当于在"好答案"上做 SFT
+
+如果 y 答错了（r=0）：
+    → 梯度项为 0，不更新（基础 REINFORCE）
+    → 进阶版（如 GRPO）会对错误答案施加负梯度惩罚
+```
+
+这也是为什么 RL 训练需要前面说的**两个原语**：
+
+- **Sampling**：生成 $y_i$ 来做 Monte Carlo 估计
+- **Scoring**：计算 $\log \pi_\theta(y_i|x_i)$ 来求梯度
+
+# einops 快速入门
+
+核心规则：相同字母 = 相同语义，不同字母 = 不同语义
+
+`einops` 用一种接近数学符号的方式操作 tensor 维度，常用来替代：
+
+```python
+reshape
+view
+permute
+transpose
+unsqueeze
+squeeze
+repeat
+mean / sum over dims
+```
+
+核心函数主要是三个：
+
+```python
+from einops import rearrange, reduce, repeat
+```
+
+## 1. `rearrange`: 重排 / reshape / flatten / unflatten
+
+最常用。
+
+```python
+from einops import rearrange
+```
+
+假设：
+
+```python
+x.shape == (batch, channels, height, width)
+```
+
+把 `NCHW` 转成 `NHWC`：
+
+```python
+y = rearrange(x, "b c h w -> b h w c")
+```
+
+flatten 空间维度：
+
+```python
+y = rearrange(x, "b c h w -> b c (h w)")
+```
+
+把图片切成 patch：
+
+```python
+y = rearrange(
+    x,
+    "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
+    p1=16,
+    p2=16,
+)
+```
+
+如果输入是：
+
+```python
+x.shape == (b, c, 224, 224)
+```
+
+输出就是：
+
+```python
+y.shape == (b, 196, 16 * 16 * c)
+```
+
+## 2. `reduce`: 聚合某些维度
+
+类似 `mean`, `sum`, `max`。
+
+```python
+from einops import reduce
+```
+
+全局平均池化：
+
+```python
+y = reduce(x, "b c h w -> b c", "mean")
+```
+
+对 height 求平均，保留 width：
+
+```python
+y = reduce(x, "b c h w -> b c w", "mean")
+```
+
+对空间维度求和：
+
+```python
+y = reduce(x, "b c h w -> b c", "sum")
+```
+
+## 3. `repeat`: 复制扩展维度
+
+```python
+from einops import repeat
+```
+
+给 token 加 batch 维度：
+
+```python
+cls_token.shape == (d,)
+
+tokens = repeat(cls_token, "d -> b d", b=32)
+```
+
+复制成图片大小：
+
+```python
+x.shape == (b, c)
+
+y = repeat(x, "b c -> b c h w", h=14, w=14)
+```
+
+## 4. pattern 读法
+
+核心格式：
+
+```text
+"输入维度 -> 输出维度"
+```
+
+例子：
+
+```python
+"b c h w -> b h w c"
+```
+
+意思是：
+
+```text
+输入: batch, channel, height, width
+输出: batch, height, width, channel
+```
+
+括号表示组合或拆分：
+
+```python
+"b c h w -> b c (h w)"
+```
+
+表示把 `h` 和 `w` 合成一个维度。
+
+```python
+"b (h w) c -> b h w c"
+```
+
+表示把一个维度拆成 `h` 和 `w`，但必须传入：
+
+```python
+rearrange(x, "b (h w) c -> b h w c", h=14, w=14)
+```
+
+## 5. 常见例子
+
+Transformer 输入从图片 patch 来：
+
+```python
+patches = rearrange(
+    imgs,
+    "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
+    p1=16,
+    p2=16,
+)
+```
+
+多头注意力拆 head：
+
+```python
+q = rearrange(q, "b n (h d) -> b h n d", h=num_heads)
+```
+
+多头注意力合并 head：
+
+```python
+out = rearrange(out, "b h n d -> b n (h d)")
+```
+
+把 batch 和 time 合并：
+
+```python
+y = rearrange(x, "b t c -> (b t) c")
+```
+
+再拆回来：
+
+```python
+x = rearrange(y, "(b t) c -> b t c", b=batch_size)
+```
+
+## 6. 最重要的习惯
+
+用 `einops` 时，最好给维度起有语义的名字：
+
+```python
+"batch channel height width -> batch height width channel"
+```
+
+或者简写：
+
+```python
+"b c h w -> b h w c"
+```
+
+比下面这种更不容易错：
+
+```python
+x.permute(0, 2, 3, 1)
+```
+
+## 一句话总结
+
+```text
+rearrange 管变形和换轴，
+reduce 管聚合，
+repeat 管复制扩展。
+```
+
+它最大的好处是：代码一眼能看出 tensor shape 怎么变。
+
